@@ -3,6 +3,7 @@ import { sendToOffscreen } from './offscreenManager';
 import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2, buildDedupGroups } from './dedupEngine';
 import { buildDomainClusters } from './organizeEngine';
 import { callCloudAPI, buildClassificationPrompt, parseClassificationResponse, buildQualityPrompt, parseQualityResponse, testConnection } from './apiClient';
+import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
 import { DEFAULT_SETTINGS, BATCH_SIZE } from '@/shared/constants';
 import type { AppSettings, QualityScores } from '@/shared/types';
@@ -244,26 +245,11 @@ async function handleRebuildIndex(): Promise<unknown> {
 // --- Real-time archiving listener ---
 
 chrome.bookmarks.onCreated.addListener(async (_id, bookmark) => {
-  if (!bookmark.url) return; // folder, skip
-
-  const settings = await getSettings();
-  if (!settings.realtimeArchiving) return;
-
   try {
-    const text = `${bookmark.title} ${bookmark.url}`;
-    const resp = await sendToOffscreen({ type: 'GENERATE_EMBEDDING', text }) as { success: boolean; data: number[] };
-
-    if (resp.success) {
-      const vector = new Float32Array(resp.data);
-      await db.putVector({
-        id: bookmark.id,
-        vector,
-        text,
-        updatedAt: Date.now(),
-      });
-    }
+    const settings = await getSettings();
+    await handleNewBookmark(bookmark, settings);
   } catch (err) {
-    console.error('[BM] Real-time indexing failed:', err);
+    console.error('[BM] Real-time archiving failed:', err);
   }
 });
 
