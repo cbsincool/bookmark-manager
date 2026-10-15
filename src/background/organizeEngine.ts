@@ -3,26 +3,15 @@ import { extractDomain } from '@/shared/urlUtils';
 import { suggestDirectoryName } from '@/shared/directoryNaming';
 import { cosineSimilarity } from '@/shared/vectorSearch';
 import {
-  SKELETON_SMALL_N,
   ASSIGN_ACCEPT_THRESHOLD,
   OVERFLOW_ACCEPT_RATIO,
   OVERFLOW_COHESION_MIN,
   maxNewDirectories,
   UNCLASSIFIED_DIR,
+  TARGET_BOOKMARKS_PER_DIR,
+  MAX_TOP_CLUSTERS,
+  MAX_SUB_CLUSTERS,
 } from '@/shared/constants';
-
-/**
- * Compute optimal K for K-means clustering based on bookmark count.
- * Formula: k = round(sqrt(n/5)), clamped to [2, 30].
- *
- * 少于 SKELETON_SMALL_N 条时取 k=1：否则 k=2 会切出两个各 2-3 条的簇，
- * 被最小簇长过滤后全部落进「未分类」——4~7 条书签的整理结果恒为空。
- */
-export function computeOptimalK(bookmarkCount: number): number {
-  if (bookmarkCount < SKELETON_SMALL_N) return 1;
-  const k = Math.round(Math.sqrt(bookmarkCount / 5));
-  return Math.max(2, Math.min(30, k));
-}
 
 /**
  * 判断某个 URL 是否为「官网门户」——根域名页（https://react.dev/）或 index 页。
@@ -261,6 +250,51 @@ export function buildSemanticClusters(
   return clusters;
 }
 
+/**
+ * 分层聚类：先分一级目录，再在每个一级目录内部细分一层。
+ *
+ * 单层 K-means 的簇数只能靠书签总数猜，猜出来的粒度很粗——1643 条书签给 18 个
+ * 目录，每目录 91 条。这里改为按「目标每目录条数」反推簇数，并在大类内再切一刀，
+ * 使叶子目录落在目标区间内。层级由代码确定，不依赖模型遵守 prompt。
+ */
+export interface HierarchicalCluster {
+  readonly top: SemanticCluster;
+  /** 二级簇。为空表示这个大类不再细分（成员本来就不多） */
+  readonly children: readonly SemanticCluster[];
+}
+
+export function buildHierarchicalClusters(
+  vectors: readonly { id: string; vector: Float32Array }[],
+  bookmarks: readonly BookmarkNode[],
+  options?: { targetPerDir?: number; maxTop?: number; maxSub?: number },
+): HierarchicalCluster[] {
+  const target = options?.targetPerDir ?? TARGET_BOOKMARKS_PER_DIR;
+  const maxTop = options?.maxTop ?? MAX_TOP_CLUSTERS;
+  const maxSub = options?.maxSub ?? MAX_SUB_CLUSTERS;
+
+  const n = vectors.length;
+  if (n === 0) return [];
+
+  const k1 = Math.max(2, Math.min(maxTop, Math.round(Math.sqrt(n / target))));
+  const tops = buildSemanticClusters(vectors, bookmarks, k1, { minClusterSize: 1 });
+  if (tops.length === 0) return [];
+
+  const vectorById = new Map(vectors.map((v) => [v.id, v.vector]));
+
+  return tops.map((top) => {
+    const memberVectors = top.bookmarkIds
+      .map((id) => ({ id, vector: vectorById.get(id) }))
+      .filter((v): v is { id: string; vector: Float32Array } => v.vector !== undefined);
+
+    const k2 = Math.max(0, Math.min(maxSub, Math.round(memberVectors.length / target)));
+    if (k2 < 2) return { top, children: [] };
+
+    const subs = buildSemanticClusters(memberVectors, bookmarks, k2, { minClusterSize: 1 });
+    // 只分出一个子簇等于没分
+    return { top, children: subs.length >= 2 ? subs : [] };
+  });
+}
+
 function euclideanDistance(a: Float32Array, b: Float32Array): number {
   let sum = 0;
   for (let i = 0; i < a.length; i++) {
@@ -339,6 +373,31 @@ export function buildSkeletonFromFolders(
   }
 
   return nodes;
+}
+
+/**
+ * 按路径合并骨架节点。
+ *
+ * 路径重复会让 `bucketize` 把同一个桶产出两次，于是同一批书签被写进多个目录、
+ * 统计口径直接翻倍（实测「成员 76 / 去重后 40」）。重复的来源有两个：
+ * 分层命名时两个子类拿到同一个名字；Chrome 允许同级出现同名文件夹。
+ */
+export function mergeSkeletonByPath(nodes: readonly SkeletonNode[]): SkeletonNode[] {
+  const byPath = new Map<string, { memberIds: string[]; centroids: Float32Array[]; isOverflow: boolean }>();
+
+  for (const node of nodes) {
+    const entry = byPath.get(node.path) ?? { memberIds: [], centroids: [], isOverflow: node.isOverflow };
+    entry.memberIds.push(...node.memberIds);
+    entry.centroids.push(node.centroid);
+    byPath.set(node.path, entry);
+  }
+
+  return Array.from(byPath.entries()).map(([path, entry]) => ({
+    path,
+    memberIds: entry.memberIds,
+    centroid: averageVectors(entry.centroids),
+    isOverflow: entry.isOverflow,
+  }));
 }
 
 export interface AssignResult {

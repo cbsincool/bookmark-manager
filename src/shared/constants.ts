@@ -48,10 +48,6 @@ export const CONNECTIVITY_TIMEOUT_MS = 15000;
 
 // --- 整理流程（骨架 → 归位 → 溢出）---
 
-/** 书签数低于此值时骨架只取 1 个簇，避免小样本被最小簇长过滤后全军覆没 */
-export const SKELETON_SMALL_N = 8;
-/** 骨架聚类的最小簇长（语义聚类入口仍用 3） */
-export const MIN_SKELETON_CLUSTER_SIZE = 1;
 /** 书签向量与骨架目录中心的余弦达到此值才归位，否则进入溢出池 */
 export const ASSIGN_ACCEPT_THRESHOLD = 0.55;
 /** 溢出比例超过此值说明阈值与数据不匹配，降级为「全部接受最近邻」 */
@@ -70,6 +66,19 @@ export const NEUTRAL_SCORE = 50;
 export const SHORT_SUMMARY_LENGTH = 80;
 /** 长于此长度视为有实质正文 */
 export const RICH_SUMMARY_LENGTH = 400;
+
+/**
+ * 分层聚类的目标：每个**叶子目录**放多少条书签。
+ *
+ * prompt 里一直写着「Target 5-20 bookmarks per directory」，但原来的
+ * `computeOptimalK = round(sqrt(n/5))` 与之严重不符——1643 条书签只给 18 个目录，
+ * 每目录 91 条，成了垃圾桶。改成按目标条数反推簇数，并在大类内再细分一层。
+ */
+export const TARGET_BOOKMARKS_PER_DIR = 12;
+/** 一级目录数量上限 */
+export const MAX_TOP_CLUSTERS = 20;
+/** 每个一级目录下的子目录数量上限 */
+export const MAX_SUB_CLUSTERS = 8;
 
 /** 兜底目录名：既归不进任何目录、也不值得单独建目录的书签放这里 */
 export const UNCLASSIFIED_DIR = '未分类';

@@ -8,7 +8,11 @@
  * 用法（凭证只走环境变量，不落盘）：
  *   BM_AI_KEY=xxx BM_AI_MODEL=deepseek-v4.1-flash npx vite-node test/verify-ai-naming.ts
  */
-import { buildClusterNamingPrompt, parseClusterNamingResponse } from '../src/background/apiClient';
+import {
+  buildClusterNamingPrompt,
+  buildHierarchicalNamingPrompt,
+  parseClusterNamingResponse,
+} from '../src/background/apiClient';
 import { normalizeDirectoryPath } from '../src/shared/directoryNaming';
 
 const ENDPOINT = process.env.BM_AI_ENDPOINT ?? 'https://ai-gateway-inside.haplat.net/devops/v1';
@@ -101,7 +105,9 @@ function reportScenario(scenario: Scenario, content: string): number {
     console.log('  !! 模型输出不是合法 JSON');
   }
 
-  const parsed = parseClusterNamingResponse(content);
+  // 传 maxDepth，测的是代码实际产出的结果——溢出命名会强制截断到 1 层，
+  // 只看模型原始输出会把「模型越界但代码拦住了」误报成失败
+  const parsed = parseClusterNamingResponse(content, scenario.maxDepth);
   let violations = 0;
   let missing = 0;
 
@@ -131,6 +137,83 @@ function reportScenario(scenario: Scenario, content: string): number {
 
   console.log(`  命名覆盖 ${scenario.clusters.length - missing}/${scenario.clusters.length}，违规 ${violations}`);
   return violations + missing;
+}
+
+/**
+ * 分层命名的输入：大类 + 子类。
+ * 关键契约是「子类只输出最后一段」——父路径由代码拼，模型不该重复大类名。
+ */
+const HIERARCHICAL = [
+  {
+    groupId: '0',
+    titles: ['Transformer 架构详解', '注意力机制', '大语言模型微调'],
+    children: [
+      { id: '0.0', titles: ['Transformer 架构详解', '注意力机制 Attention', '位置编码'] },
+      { id: '0.1', titles: ['大语言模型微调实践', 'LoRA 低秩适配', '提示词工程指南'] },
+    ],
+  },
+  {
+    groupId: '1',
+    titles: ['React Hooks 教程', 'Vue 3 组合式 API'],
+    children: [
+      { id: '1.0', titles: ['React Hooks 教程', 'React 状态管理'] },
+      { id: '1.1', titles: ['Vue 3 组合式 API', 'Vite 构建优化'] },
+    ],
+  },
+  {
+    groupId: '2',
+    titles: ['个人理财入门', '基金定投策略'],
+    children: [],
+  },
+];
+
+async function checkHierarchical(): Promise<number> {
+  console.log('='.repeat(64));
+  console.log('分层命名（大类 + 子类，子类只出最后一段）');
+  console.log('='.repeat(64));
+
+  const prompt = buildHierarchicalNamingPrompt(HIERARCHICAL, ['技术文档', '学习资料']);
+  const started = Date.now();
+  const content = await callModel(prompt);
+  console.log(`耗时 ${Date.now() - started}ms`);
+  console.log('--- 模型原始输出 ---');
+  console.log(content || '(空)');
+
+  const parsed = parseClusterNamingResponse(content);
+  let problems = 0;
+
+  console.log('--- 逐项核对 ---');
+  for (const group of HIERARCHICAL) {
+    const top = parsed[group.groupId];
+    if (!top) {
+      problems++;
+      console.log(`  [大类 ${group.groupId}] !! 未命名`);
+    } else {
+      const bad = /\s/.test(top) || (/[一-鿿]/.test(top) && /[A-Za-z]/.test(top));
+      if (bad) problems++;
+      console.log(`  [大类 ${group.groupId}] ${JSON.stringify(top)}${bad ? '   ← 违规' : ''}`);
+    }
+
+    for (const child of group.children) {
+      const name = parsed[child.id];
+      if (!name) {
+        problems++;
+        console.log(`    [子类 ${child.id}] !! 未命名`);
+        continue;
+      }
+      const issues: string[] = [];
+      if (/\s/.test(name)) issues.push('含空格');
+      if (/[一-鿿]/.test(name) && /[A-Za-z]/.test(name)) issues.push('中英混排');
+      // 子类不该重复大类名（父路径由代码拼）
+      if (top && name.startsWith(top + '/')) issues.push('重复了父路径');
+      if (name.includes('/')) issues.push('含斜杠');
+      if (issues.length > 0) problems++;
+      console.log(`    [子类 ${child.id}] ${JSON.stringify(name)}${issues.length ? '   ← ' + issues.join('、') : ''}`);
+    }
+  }
+
+  console.log(problems === 0 ? '\n结果: 分层命名通过' : `\n结果: ${problems} 项不通过`);
+  return problems;
 }
 
 async function main(): Promise<number> {
@@ -168,6 +251,8 @@ async function main(): Promise<number> {
     failures += reportScenario(scenario, content);
     console.log('');
   }
+
+  failures += await checkHierarchical();
 
   console.log('='.repeat(64));
   console.log(failures === 0 ? '结果: 全部通过' : `结果: ${failures} 项不通过`);

@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
-  computeOptimalK,
+  buildHierarchicalClusters,
   buildSemanticClusters,
   assignToSkeleton,
+  mergeSkeletonByPath,
   groupOverflow,
   mergeDirectoryTree,
 } from '../organizeEngine';
@@ -36,19 +37,6 @@ const bm = (id: string, title: string): BookmarkNode => ({
   title,
   url: 'https://example.com',
   path: '',
-});
-
-describe('computeOptimalK', () => {
-  it('returns 1 for small sets so they are not filtered away', () => {
-    // k=2 会切出两个各 2-3 条的簇，被最小簇长过滤后全部落进「未分类」
-    expect(computeOptimalK(4)).toBe(1);
-    expect(computeOptimalK(7)).toBe(1);
-  });
-
-  it('scales with the bookmark count once past the small-set branch', () => {
-    expect(computeOptimalK(20)).toBe(2);
-    expect(computeOptimalK(500)).toBe(10);
-  });
 });
 
 describe('buildSemanticClusters', () => {
@@ -261,5 +249,96 @@ describe('mergeDirectoryTree', () => {
   it('appends unassigned bookmarks to 未分类', () => {
     const tree = mergeDirectoryTree([{ path: '编程', ids: ['a'] }], ['x', 'y']);
     expect(tree).toEqual({ 编程: ['a'], 未分类: ['x', 'y'] });
+  });
+});
+
+describe('buildHierarchicalClusters', () => {
+  /**
+   * 造 n 条书签，落在 `topics` 个方向附近。
+   *
+   * 噪声不能太小：主题若完全正交，未被选作种子的主题只能靠噪声决定归属，
+   * 会全部挤进同一个簇——那是合成数据的病态，真实嵌入不是这样。
+   */
+  function makeCorpus(n: number, topics: number) {
+    const dim = topics;
+    const noise = 0.35;
+    const vectors = Array.from({ length: n }, (_, i) => {
+      const topic = i % topics;
+      // 确定性的伪随机噪声，避免测试不稳定
+      const jitter = (k: number) => {
+        const x = Math.sin((i + 1) * 12.9898 + k * 78.233) * 43758.5453;
+        return (x - Math.floor(x) - 0.5) * 2 * noise;
+      };
+      const dir = Array.from({ length: dim }, (_, d) => (d === topic ? 1 : 0) + jitter(d));
+      return { id: `b${i}`, vector: unit(...dir) };
+    });
+    return { vectors, bookmarks: vectors.map((v) => bm(v.id, `${v.id} 标题`)) };
+  }
+
+  it('keeps leaf directories near the target size instead of one big dumping ground', () => {
+    // 单层聚类时 40 条书签只给 k=3，实测出现 32 条一个目录的垃圾桶
+    const { vectors, bookmarks } = makeCorpus(40, 8);
+    const groups = buildHierarchicalClusters(vectors, bookmarks, { targetPerDir: 12 });
+
+    const leaves = groups.flatMap((g) =>
+      g.children.length > 0 ? g.children.map((c) => c.bookmarkIds.length) : [g.top.bookmarkIds.length],
+    );
+
+    expect(leaves.length).toBeGreaterThan(2);
+    expect(Math.max(...leaves)).toBeLessThanOrEqual(20);
+    expect(leaves.reduce((a, b) => a + b, 0)).toBe(40);
+  });
+
+  it('does not subdivide when the sub-level is disabled', () => {
+    // organizeMaxDepth=1 表示用户明确不要层级
+    const { vectors, bookmarks } = makeCorpus(40, 8);
+    const groups = buildHierarchicalClusters(vectors, bookmarks, { maxSub: 0 });
+    expect(groups.every((g) => g.children.length === 0)).toBe(true);
+  });
+
+  it('accounts for every bookmark exactly once', () => {
+    const { vectors, bookmarks } = makeCorpus(60, 6);
+    const groups = buildHierarchicalClusters(vectors, bookmarks, { targetPerDir: 10 });
+
+    const seen = groups.flatMap((g) =>
+      g.children.length > 0
+        ? g.children.flatMap((c) => c.bookmarkIds)
+        : [...g.top.bookmarkIds],
+    );
+    expect(seen.sort()).toEqual(vectors.map((v) => v.id).sort());
+  });
+
+  it('returns nothing for an empty corpus', () => {
+    expect(buildHierarchicalClusters([], [])).toEqual([]);
+  });
+});
+
+describe('mergeSkeletonByPath', () => {
+  it('merges nodes that share a path so no bucket is emitted twice', () => {
+    // 分层命名时两个子类可能拿到同一个名字；Chrome 也允许同级出现同名文件夹。
+    // 路径重复会让 bucketize 把同一个桶产出两次，统计口径直接翻倍
+    const merged = mergeSkeletonByPath([
+      node('机器学习', unit(1, 0, 0, 0)),
+      node('机器学习', unit(0, 1, 0, 0)),
+      node('前端', unit(0, 0, 1, 0)),
+    ]);
+
+    expect(merged.map((n) => n.path)).toEqual(['机器学习', '前端']);
+    expect(merged[0].centroid.length).toBe(4);
+  });
+
+  it('never lets a bookmark be counted twice', () => {
+    const skeleton = mergeSkeletonByPath([
+      node('机器学习', unit(1, 0, 0, 0)),
+      node('机器学习', unit(0, 1, 0, 0)),
+    ]);
+    const result = assignToSkeleton(
+      [{ id: 'v1', vector: unit(1, 0, 0, 0) }],
+      skeleton,
+      0.55,
+    );
+
+    const ids = result.assigned.flatMap((b) => b.ids);
+    expect(ids).toEqual([...new Set(ids)]);
   });
 });

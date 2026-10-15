@@ -2,14 +2,14 @@ import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, 
 import { generateEmbedding, generateEmbeddingsBatch } from './embeddingClient';
 import { rerank } from './rerankerClient';
 import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2Content, scoreL3, buildDedupGroups } from './dedupEngine';
-import { buildDomainClusters, computeDirectoryCohesion, computeDirectoryVector, buildSemanticClusters, computeOptimalK, assignToSkeleton, groupOverflow, mergeDirectoryTree, buildSkeletonFromFolders, averageVectors } from './organizeEngine';
-import type { SkeletonNode, OverflowItem, SemanticCluster, OverflowGroup } from './organizeEngine';
-import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse, buildClusterNamingPrompt, parseClusterNamingResponse } from './apiClient';
+import { buildDomainClusters, computeDirectoryCohesion, computeDirectoryVector, buildSemanticClusters, assignToSkeleton, groupOverflow, mergeDirectoryTree, buildSkeletonFromFolders, averageVectors, buildHierarchicalClusters, mergeSkeletonByPath } from './organizeEngine';
+import type { SkeletonNode, OverflowItem, SemanticCluster, OverflowGroup, HierarchicalCluster } from './organizeEngine';
+import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse, buildClusterNamingPrompt, buildHierarchicalNamingPrompt, parseClusterNamingResponse } from './apiClient';
 import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
 import { cosineSimilarity } from '@/shared/vectorSearch';
-import { suggestDirectoryName } from '@/shared/directoryNaming';
-import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, ASSIGN_ACCEPT_THRESHOLD, MIN_SKELETON_CLUSTER_SIZE, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS } from '@/shared/constants';
+import { suggestDirectoryName, normalizeDirectoryPath } from '@/shared/directoryNaming';
+import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS, MAX_SUB_CLUSTERS } from '@/shared/constants';
 import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats, OrganizeMode } from '@/shared/types';
 import type { MessageRequest, MessageResponse, AsyncTask } from '@/shared/messageTypes';
 
@@ -660,39 +660,6 @@ async function handleAIClassifyPoll(taskId: string): Promise<AsyncTask> {
   return task;
 }
 
-/**
- * 整理流程：全量定骨架 → 逐条归位 → 溢出成组 → 汇合。
- *
- * 骨架由全量语义聚类产出（保证目录层次与全局主题结构一致），
- * 但每条书签的最终归属由它自己的向量与各目录中心的余弦决定——
- * 与所有目录都不像的书签才会触发新建目录。
- */
-
-/**
- * 把聚类结果落成目录骨架。同名的簇合并成一个目录并重算中心——
- * AI 很容易给两个不同的簇起同一个名字。
- */
-function buildSkeleton(
-  clusters: readonly SemanticCluster[],
-  naming: Readonly<Record<string, string>>,
-  vectorMap: ReadonlyMap<string, Float32Array>,
-): SkeletonNode[] {
-  const byPath = new Map<string, string[]>();
-
-  clusters.forEach((cluster, i) => {
-    const path = naming[String(i)] || cluster.topicName || `分类${i + 1}`;
-    byPath.set(path, [...(byPath.get(path) ?? []), ...cluster.bookmarkIds]);
-  });
-
-  return Array.from(byPath.entries()).map(([path, memberIds]) => {
-    const vectors = memberIds
-      .map((id) => vectorMap.get(id))
-      .filter((v): v is Float32Array => v !== undefined);
-
-    return { path, memberIds, centroid: averageVectors(vectors), isOverflow: false };
-  });
-}
-
 interface NamingOutcome {
   readonly paths: Record<string, string>;
   /** 模型是否真的产出了可用命名（false = 静默退回了关键词命名） */
@@ -701,33 +668,79 @@ interface NamingOutcome {
   readonly detail?: string;
 }
 
-/** 让 AI 给每个簇命名；AI 不可用或调用失败时退回关键词命名 */
-async function nameClusters(
-  clusters: readonly SemanticCluster[],
+/**
+ * 把分层聚类落成目录骨架。
+ *
+ * 层级由代码拼：大类名 + 子类名 → `大类/子类`。模型只负责给每一段起名字，
+ * 不需要理解「这几个子类属于同一个大类」，所以层级不会被它搞乱。
+ */
+function buildHierarchicalSkeleton(
+  groups: readonly HierarchicalCluster[],
+  names: Readonly<Record<string, string>>,
+  vectorMap: ReadonlyMap<string, Float32Array>,
+): SkeletonNode[] {
+  const nodes: SkeletonNode[] = [];
+
+  groups.forEach((group, i) => {
+    const topName = names[String(i)] || group.top.topicName || `分类${i + 1}`;
+
+    if (group.children.length === 0) {
+      nodes.push({
+        path: topName,
+        memberIds: group.top.bookmarkIds,
+        centroid: group.top.centroid,
+        isOverflow: false,
+      });
+      return;
+    }
+
+    group.children.forEach((child, j) => {
+      const subName = names[`${i}.${j}`] || child.topicName || `子类${j + 1}`;
+      // 走一遍归一化：降级命名时父子可能拿到同一个词（「文档/文档」），
+      // normalizeDirectoryPath 会折叠连续重复段
+      nodes.push({
+        path: normalizeDirectoryPath(`${topName}/${subName}`),
+        memberIds: child.bookmarkIds,
+        centroid: child.centroid,
+        isOverflow: false,
+      });
+    });
+  });
+
+  return nodes;
+}
+
+/** 给分层聚类命名。与 nameClusters 同构，只是输入输出带上了层级 */
+async function nameHierarchical(
+  groups: readonly HierarchicalCluster[],
   titleById: ReadonlyMap<string, string>,
   settings: AppSettings,
   canUseAI: boolean,
   userCategories: readonly string[] | undefined,
-  maxDepth: number,
 ): Promise<NamingOutcome> {
   const fallback: Record<string, string> = {};
-  clusters.forEach((cluster, i) => {
-    fallback[String(i)] = cluster.topicName || `分类${i + 1}`;
+  groups.forEach((group, i) => {
+    fallback[String(i)] = group.top.topicName;
+    group.children.forEach((child, j) => {
+      fallback[`${i}.${j}`] = child.topicName;
+    });
   });
 
   if (!canUseAI) return { paths: fallback, usedAi: false, detail: '未配置可用的模型' };
 
-  const clusterInput = clusters.map((cluster, i) => ({
-    clusterId: String(i),
-    titles: cluster.bookmarkIds
-      .slice(0, 12)
-      .map((id) => titleById.get(id) ?? '')
-      .filter(Boolean),
-  }));
-  const prompt = buildClusterNamingPrompt(clusterInput, maxDepth, userCategories);
+  const titlesOf = (ids: readonly string[]): string[] =>
+    ids.slice(0, 8).map((id) => titleById.get(id) ?? '').filter(Boolean);
 
-  // 模型偶尔会回一段散文而不是 JSON（实测约每几次出现一次），这种失败重试一次
-  // 基本就好了。不重试的话用户会莫名其妙地拿到关键词命名的结果。
+  const input = groups.map((group, i) => ({
+    groupId: String(i),
+    titles: titlesOf(group.top.bookmarkIds),
+    children: group.children.map((child, j) => ({
+      id: `${i}.${j}`,
+      titles: titlesOf(child.bookmarkIds),
+    })),
+  }));
+
+  const prompt = buildHierarchicalNamingPrompt(input, userCategories);
   const ATTEMPTS = 2;
   let lastDetail = '';
 
@@ -735,21 +748,19 @@ async function nameClusters(
     try {
       const raw = await callCloudAPI(prompt, settings);
       const parsed = parseClusterNamingResponse(raw);
-
-      // 模型可能只回了一部分簇，也可能回了一堆解析不出来的东西。
-      // 一个都没解析出来就算失败——否则用户会以为名字是模型起的。
-      const covered = clusters.filter((_, i) => parsed[String(i)]).length;
+      // 至少要有一个大类被命名，否则整份输出都是废的
+      const covered = groups.filter((_, i) => parsed[String(i)]).length;
       if (covered > 0) {
         return { paths: { ...fallback, ...parsed }, usedAi: true };
       }
-      lastDetail = `模型输出解析不出任何目录（${raw.length} 字符）: ${raw.trim().slice(0, 150)}`;
+      lastDetail = `模型输出解析不出任何大类（${raw.length} 字符）: ${raw.trim().slice(0, 150)}`;
     } catch (err) {
-      console.warn(`[Organize] AI 命名第 ${attempt} 次失败:`, err);
+      console.warn(`[Organize] 分层命名第 ${attempt} 次失败:`, err);
       lastDetail = String(err).slice(0, 300);
     }
   }
 
-  console.warn('[Organize] AI 命名失败，退回关键词命名:', lastDetail);
+  console.warn('[Organize] 分层命名失败，退回关键词命名:', lastDetail);
   return { paths: fallback, usedAi: false, detail: lastDetail };
 }
 
@@ -777,6 +788,15 @@ async function nameOverflowGroups(
   }
 }
 
+/**
+ * 整理流程：定骨架 → 逐条归位 → 溢出成组 → 汇合。
+ *
+ * 骨架来源由 mode 决定：
+ *   fit    —— 现有目录结构。归得对的书签移动是空操作，归错的才会被移走，
+ *             所以可以反复整理而不会来回搬动。
+ *   replan —— 分层聚类重新生成（先分大类，再在大类内细分一层）。
+ * 无论哪种，每条书签的最终归属都由它自己的向量与各目录中心的余弦决定。
+ */
 async function processAIClassify(
   taskId: string,
   bookmarks: readonly BookmarkNode[],
@@ -893,31 +913,26 @@ async function processAIClassify(
     let namingDetail: string | undefined;
 
     if (skeleton.length === 0) {
-      const k = computeOptimalK(vectors.length);
-      updateProgress(0, total, `语义聚类中 (k=${k})`);
-      const clusters = buildSemanticClusters(vectors, [...bookmarks], k, {
-        minClusterSize: MIN_SKELETON_CLUSTER_SIZE,
-      });
+      // 分层聚类：按「目标每目录条数」反推簇数，并在大类内再细分一层。
+      // 单层 K-means 只能靠书签总数猜粒度，1643 条书签给 18 个目录、每目录 91 条，
+      // 等于没整理。organizeMaxDepth=1 时用户明确不要层级，就不细分。
+      const maxSub = (settings.organizeMaxDepth ?? 3) >= 2 ? MAX_SUB_CLUSTERS : 0;
+      updateProgress(0, total, '语义聚类中');
+      const groups = buildHierarchicalClusters(vectors, [...bookmarks], { maxSub });
 
-      if (clusters.length === 0) {
+      if (groups.length === 0) {
         finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
         return;
       }
 
-      updateProgress(0, clusters.length, `AI 命名中 (0/${clusters.length})`);
-      const naming = await nameClusters(
-        clusters,
-        titleById,
-        settings,
-        canUseAI,
-        userCategories,
-        settings.organizeMaxDepth ?? 3,
-      );
-      updateProgress(clusters.length, clusters.length, 'AI 命名完成');
+      const leafCount = groups.reduce((n, g) => n + Math.max(1, g.children.length), 0);
+      updateProgress(0, groups.length, `AI 命名中 (${groups.length} 个大类 / ${leafCount} 个目录)`);
+      const naming = await nameHierarchical(groups, titleById, settings, canUseAI, userCategories);
+      updateProgress(groups.length, groups.length, 'AI 命名完成');
       namedWithAi = naming.usedAi;
       namingDetail = naming.detail;
 
-      skeleton = buildSkeleton(clusters, naming.paths, vectorMap);
+      skeleton = buildHierarchicalSkeleton(groups, naming.paths, vectorMap);
 
       // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
       // 必须用 getDirectoryPathsUnder（相对书签栏）——findOrCreateFolderPath 的基准
@@ -927,6 +942,9 @@ async function processAIClassify(
         skeleton = skeleton.filter((node) => existing.has(node.path));
       }
     }
+
+    // 路径重复会让 bucketize 产出重复的桶（同一批书签被写进多个目录）
+    skeleton = mergeSkeletonByPath(skeleton);
 
     // --- 阶段 2：逐条归位 ---
     updateProgress(0, total, `归位中 (0/${total})`);

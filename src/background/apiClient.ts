@@ -465,6 +465,66 @@ ${categoryHint}
 ${clusterList}`;
 }
 
+/** 分层命名的输入：一个大类 + 它的子类 */
+export interface HierarchicalNamingInput {
+  readonly groupId: string;
+  readonly titles: readonly string[];
+  readonly children: readonly { readonly id: string; readonly titles: readonly string[] }[];
+}
+
+/**
+ * 两层聚类的命名 prompt。
+ *
+ * 关键约束：**子类只输出最后一段**，父路径由调用方拼接。这样层级结构由代码决定，
+ * 不依赖模型理解「这几个子类属于同一个大类」——它只要给每段起个名字就行。
+ */
+export function buildHierarchicalNamingPrompt(
+  groups: readonly HierarchicalNamingInput[],
+  userCategories?: readonly string[],
+): string {
+  const rendered = groups
+    .map((g) => {
+      const head = g.titles.slice(0, 8).map((t) => `    - ${t}`).join('\n');
+      const kids = g.children
+        .map((c) => {
+          const lines = c.titles.slice(0, 8).map((t) => `      - ${t}`).join('\n');
+          return `  [子类 ${c.id}] (${c.titles.length} 条)\n${lines}`;
+        })
+        .join('\n');
+      return `[大类 ${g.groupId}] (${g.titles.length} 条)\n${head}${kids ? '\n' + kids : ''}`;
+    })
+    .join('\n\n');
+
+  const categoryHint =
+    userCategories && userCategories.length > 0
+      ? `\n用户已有的一级目录（优先复用，无需强制）：${userCategories.join('、')}\n`
+      : '';
+
+  return `你是书签整理助手。下面是两层结构的语义聚类：每个「大类」下可能有若干「子类」。
+为每个大类、每个子类各起一个名字。
+${categoryHint}
+命名规则（最重要，务必遵守）：
+- 每个名字必须是「一个完整的词」，读起来像人给文件夹起的名字
+- 绝对不能包含空格；一个概念需要多个词时，拼成一个词或改用中文
+- 不要中英混排（"机器学习 Machine Learning" 这类重复表达一律不合格）
+- 不要带 "教程/指南/Tutorial/Guide/Notes" 之类的描述性后缀
+
+**大类名**：一级目录名
+**子类名**：只输出**最后一段**，不要含 "/"。程序会把它拼到所属大类后面，
+    所以不要重复大类名（大类叫"人工智能"时，子类写"机器学习"而不是"人工智能/机器学习"）
+
+正例（左边合格，右边是不合格的写法）：
+    "人工智能"  ← "AI 人工智能"
+    "机器学习"  ← "Machine Learning 教程"
+    "容器编排"  ← "K8s 容器编排"
+    "ReactHooks" ← "React Hooks 教程"
+
+只输出 JSON，不要任何解释：{ "0": "大类名", "0.0": "子类名", "0.1": "子类名", "1": "大类名", ... }
+
+聚类：
+${rendered}`;
+}
+
 export interface ClusterNamingResult {
   [clusterId: string]: string;
 }
