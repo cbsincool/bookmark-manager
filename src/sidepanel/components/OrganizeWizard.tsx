@@ -351,8 +351,25 @@ export function OrganizeWizard() {
       });
 
       if (resp?.success) {
-        setProgressMsg(t('organize.execute.done'));
-        setTimeout(() => { store.reset(); setProgressMsg(''); }, 1500);
+        // 把执行结果如实报出来。此前只显示一句「完成」，而 moved 里混着
+        // 「本来就在这个目录」的空操作，用户看不出整理到底动没动
+        const r = (resp.data ?? {}) as {
+          moved?: number; inPlace?: number; skipped?: number;
+          pruned?: number; failed?: number; failures?: string[];
+        };
+        const parts = [
+          `${t('organize.execute.moved')} ${r.moved ?? 0}`,
+          `${t('organize.execute.inPlace')} ${r.inPlace ?? 0}`,
+        ];
+        if (r.skipped) parts.push(`${t('organize.execute.skipped')} ${r.skipped}`);
+        if (r.pruned) parts.push(`${t('organize.execute.pruned')} ${r.pruned}`);
+        if (r.failed) parts.push(`${t('organize.execute.failed')} ${r.failed}`);
+
+        setProgressMsg(`${t('organize.execute.done')} — ${parts.join('，')}`);
+        if (r.failures?.length) setErrorMsg(r.failures.join('\n'));
+        if (!r.failed) {
+          setTimeout(() => { store.reset(); setProgressMsg(''); }, 4000);
+        }
       } else {
         setErrorMsg(resp?.error || '执行失败');
       }

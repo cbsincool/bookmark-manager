@@ -870,6 +870,9 @@ async function processAIClassify(
     //   由此结构性成立，不靠任何「已归类」记账，重复整理也就安全了。
     // replan：每次重新聚类生成骨架，目录结构会重构（推倒重来的场景）。
     let skeleton: SkeletonNode[] = [];
+    // 骨架是否真的来自现有目录。聚类生成的骨架里 memberIds 是「簇成员」而非
+    // 「已在该目录里」，不能拿来做「无需移动」的判断
+    let skeletonFromFolders = false;
 
     if (mode === 'fit') {
       const rootFolderId = await getRootFolderId();
@@ -882,6 +885,7 @@ async function processAIClassify(
       );
       updateProgress(0, usable.length, `读取现有目录 (${usable.length} 个)`);
       skeleton = buildSkeletonFromFolders(usable, vectorMap);
+      skeletonFromFolders = skeleton.length > 0;
     }
 
     // 没有可用目录（首次整理）或用户选择重新规划 → 退回聚类生成骨架
@@ -929,6 +933,22 @@ async function processAIClassify(
     const assignment = assignToSkeleton(vectors, skeleton, ASSIGN_ACCEPT_THRESHOLD);
     updateProgress(total, total, '归位完成');
 
+    // fit 模式下，骨架的成员就是各目录现有的书签。若每条书签都已经在它该去的
+    // 目录里，整理结果就是「原地不动」——这在书签全挤在一个文件夹时必然发生，
+    // 而界面上看不出任何变化，用户只会以为功能坏了。明确报出来。
+    let needMove = Number.POSITIVE_INFINITY;
+    if (skeletonFromFolders) {
+      const alreadyHome = assignment.assigned.reduce((sum, bucket) => {
+        const node = skeleton.find((s) => s.path === bucket.path);
+        const own = new Set(node?.memberIds ?? []);
+        return sum + bucket.ids.filter((id) => own.has(id)).length;
+      }, 0);
+      needMove =
+        assignment.assigned.reduce((sum, b) => sum + b.ids.length, 0) -
+        alreadyHome +
+        assignment.overflowIds.length;
+    }
+
     // --- 阶段 3：溢出成组 ---
     let overflowEntries: { path: string; ids: string[] }[] = [];
     let unassignedIds = [...assignment.overflowIds];
@@ -973,6 +993,7 @@ async function processAIClassify(
       overflowDirectories: overflowEntries.length,
       unassigned: unassignedIds.length,
       warning:
+        (needMove === 0 ? 'nothing-to-do' : undefined) ??
         assignment.warning ??
         (namedWithAi === null
           ? undefined
@@ -1002,7 +1023,11 @@ async function handleOrganizeExecute(
   rootId: string,
 ): Promise<unknown> {
   let moved = 0;
+  // 已经在目标目录里的书签不该算「已移动」——它们在 fit 模式下占绝大多数，
+  // 混进 moved 会让人以为整理干了活，实际一条都没动
+  let inPlace = 0;
   let skipped = 0;
+  const failures: string[] = [];
   const allVectors = await db.getAllVectors();
   const vectorMap = new Map(allVectors.map((v) => [v.id, v.vector]));
 
@@ -1029,12 +1054,19 @@ async function handleOrganizeExecute(
 
     // Move bookmarks to this folder
     for (const bookmarkId of bookmarkIds) {
+      const sourceId = parentOf.get(bookmarkId);
+      if (sourceId === folderId) {
+        inPlace++;
+        continue;
+      }
       try {
-        const sourceId = parentOf.get(bookmarkId);
         await moveBookmark(bookmarkId, folderId);
-        if (sourceId && sourceId !== folderId) emptied.add(sourceId);
+        if (sourceId) emptied.add(sourceId);
         moved++;
       } catch (err) {
+        // 失败必须带出来：service worker 的日志在界面上看不到，
+        // 静默跳过会让「整理没反应」变成一个查不出的谜
+        if (failures.length < 5) failures.push(`${bookmarkId}: ${String(err)}`);
         console.warn(`[BM] Failed to move bookmark ${bookmarkId}:`, err);
       }
     }
@@ -1060,7 +1092,7 @@ async function handleOrganizeExecute(
   // 清理本次搬空的目录（不动用户自己留的空文件夹）
   const pruned = await pruneEmptiedFolders(emptied);
 
-  return { moved, skipped, pruned };
+  return { moved, inPlace, skipped, pruned, failed: failures.length, failures };
 }
 
 /**

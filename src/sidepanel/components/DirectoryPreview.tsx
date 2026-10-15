@@ -57,6 +57,9 @@ export function DirectoryPreview({ proposal, onExecute, onCancel, onRefineDir }:
           {stats.warning === 'ai-unavailable' && (
             <p className="text-[11px] text-gray-500">{t('organize.stats.warnAi')}</p>
           )}
+          {stats.warning === 'nothing-to-do' && (
+            <p className="text-[11px] text-warning">{t('organize.stats.warnNothingToDo')}</p>
+          )}
           {stats.warning === 'ai-naming-failed' && (
             <p className="text-[11px] text-warning">{t('organize.stats.warnAiFailed')}</p>
           )}

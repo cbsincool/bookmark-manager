@@ -104,7 +104,13 @@ export interface OrganizeStats {
   readonly overflowDirectories: number;
   readonly unassigned: number;
   readonly acceptThreshold: number;
-  readonly warning?: 'threshold-too-high' | 'vector-dim-mismatch' | 'ai-unavailable' | 'ai-naming-failed';
+  readonly warning?:
+    | 'threshold-too-high'
+    | 'vector-dim-mismatch'
+    | 'ai-unavailable'
+    | 'ai-naming-failed'
+    /** fit 模式下没有任何书签需要换位置——现有结构已经是这个样子 */
+    | 'nothing-to-do';
   /** 告警的具体原因（例如 AI 调用的原始错误），用于排查——后台日志在扩展里看不见 */
   readonly warningDetail?: string;
 }
