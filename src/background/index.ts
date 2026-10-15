@@ -916,8 +916,8 @@ async function processAIClassify(
       skeleton = buildSkeleton(clusters, naming.paths, vectorMap);
 
       // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
-      // 必须用相对书签栏的路径比对——findOrCreateFolderPath 的基准是书签栏，
-      // getAllDirectoryPaths 产出的是带「书签栏」前缀的路径，两者对不上。
+      // 必须用 getDirectoryPathsUnder（相对书签栏）——findOrCreateFolderPath 的基准
+      // 就是书签栏，用从书签树根开始走的路径会多一层前缀，永远匹配不上。
       if (settings.onlyUseExistingDirectories) {
         const existing = new Set(await getDirectoryPathsUnder(await getRootFolderId()));
         skeleton = skeleton.filter((node) => existing.has(node.path));

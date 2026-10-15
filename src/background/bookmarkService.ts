@@ -74,28 +74,6 @@ export async function findOrCreateFolderPath(
   return currentParentId;
 }
 
-/**
- * Get all existing directory paths (folders only, not bookmarks)
- */
-export async function getAllDirectoryPaths(): Promise<string[]> {
-  const tree = await chrome.bookmarks.getTree();
-  const paths: string[] = [];
-
-  function walk(nodes: chrome.bookmarks.BookmarkTreeNode[], parentPath = ''): void {
-    for (const node of nodes) {
-      if (!node.url && node.children) {
-        // It's a folder
-        const currentPath = parentPath ? `${parentPath}/${node.title}` : node.title;
-        paths.push(currentPath);
-        walk(node.children, currentPath);
-      }
-    }
-  }
-
-  walk(tree);
-  return paths;
-}
-
 /** 书签栏的 id —— `getTree()` 根节点的第一个子节点。目录路径的基准是它 */
 export async function getRootFolderId(): Promise<string> {
   const tree = await chrome.bookmarks.getTree();

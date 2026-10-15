@@ -2,7 +2,8 @@ import { BookmarkDB } from '@/shared/db';
 import { generateEmbedding } from './embeddingClient';
 import { cosineSimilarity } from '@/shared/vectorSearch';
 import { callCloudAPI, buildClassificationPrompt, parseClassificationResponse } from './apiClient';
-import { moveBookmark, findOrCreateFolderPath, getAllDirectoryPaths } from './bookmarkService';
+import { moveBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder } from './bookmarkService';
+import { normalizeDirectoryPath } from '@/shared/directoryNaming';
 import type { AppSettings } from '@/shared/types';
 
 const db = new BookmarkDB();
@@ -48,7 +49,10 @@ export async function handleNewBookmark(
   } else if (settings.apiEndpoint && settings.apiKey) {
     // Ask cloud API for classification
     try {
-      const existingPaths = settings.onlyUseExistingDirectories ? await getAllDirectoryPaths() : undefined;
+      const rootId = await getRootFolderId();
+      const existingPaths = settings.onlyUseExistingDirectories
+        ? await getDirectoryPathsUnder(rootId)
+        : undefined;
       const prompt = buildClassificationPrompt(
         [{ id: bookmark.id, title: bookmark.title, url: bookmark.url, path: '' }],
         settings.topLevelCategories,
@@ -63,15 +67,12 @@ export async function handleNewBookmark(
       const firstPath = Object.keys(classification)[0];
 
       if (firstPath) {
-        const pathParts = firstPath.split('/');
-        const tree = await chrome.bookmarks.getTree();
-        const rootId = tree[0]?.children?.[0]?.id ?? '1';
-
         if (settings.onlyUseExistingDirectories) {
-          // Only move if the path already exists
-          const allPaths = await getAllDirectoryPaths();
-          if (allPaths.includes(firstPath)) {
-            const folderId = await findOrCreateFolderPath(pathParts, rootId);
+          // 只在路径确实已存在时才移动。比对的是**真实存在的目录名**，
+          // 所以这里不能用归一化后的名字——用户自己建的 "React Hooks" 带空格，
+          // 归一化成 "ReactHooks" 反而永远匹配不上
+          if ((existingPaths ?? []).includes(firstPath)) {
+            const folderId = await findOrCreateFolderPath(firstPath.split('/'), rootId);
             await moveBookmark(bookmark.id, folderId);
             chrome.notifications.create({
               type: 'basic',
@@ -89,15 +90,19 @@ export async function handleNewBookmark(
             });
           }
         } else {
-          // Create folders as needed
-          const folderId = await findOrCreateFolderPath(pathParts, rootId);
-          await moveBookmark(bookmark.id, folderId);
-          chrome.notifications.create({
-            type: 'basic',
-            iconUrl: 'icons/icon48.png',
-            title: 'Bookmark Archived',
-            message: `"${bookmark.title}" → ${firstPath}`,
-          });
+          // 新建目录时要走和整理模块同一套命名清洗，否则会建出 "飞书 Backup Docs"
+          // 这类带空格的名字——「禁空格」的规则只在生成新名字时适用
+          const newPath = normalizeDirectoryPath(firstPath);
+          if (newPath) {
+            const folderId = await findOrCreateFolderPath(newPath.split('/'), rootId);
+            await moveBookmark(bookmark.id, folderId);
+            chrome.notifications.create({
+              type: 'basic',
+              iconUrl: 'icons/icon48.png',
+              title: 'Bookmark Archived',
+              message: `"${bookmark.title}" → ${newPath}`,
+            });
+          }
         }
       }
     } catch (err) {
