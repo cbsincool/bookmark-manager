@@ -115,9 +115,6 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
     case 'ORGANIZE_EXECUTE':
       return handleOrganizeExecute(msg.directoryTree, msg.rootId);
 
-    case 'ORGANIZE_RECLASSIFY':
-      return handleReclassify(msg.sourceFolders, msg.targetCategory);
-
     case 'GET_FOLDER_STRUCTURE':
       return handleGetFolderStructure();
 
@@ -1115,7 +1112,7 @@ async function buildParentMap(): Promise<Map<string, string>> {
   return parentOf;
 }
 
-// --- Folder Structure & Reclassify ---
+// --- Folder Structure ---
 
 async function handleGetFolderStructure(): Promise<unknown> {
   const tree = await chrome.bookmarks.getTree();
@@ -1152,55 +1149,6 @@ async function handleGetFolderStructure(): Promise<unknown> {
   return collectFolders(root, '');
 }
 
-async function handleReclassify(
-  sourceFolders: readonly string[],
-  targetCategory: string,
-): Promise<unknown> {
-  const settings = await getSettings();
-  if (!settings.apiEndpoint || !settings.apiKey) {
-    throw new Error('API not configured');
-  }
-
-  const allBookmarks = await getAllBookmarks();
-
-  // Get bookmarks from source folders
-  const bookmarksToReclassify = allBookmarks.filter((b) => {
-    const topFolder = b.path.split('/')[0];
-    return sourceFolders.includes(topFolder);
-  });
-
-  if (bookmarksToReclassify.length === 0) {
-    return { moved: 0, message: 'No bookmarks to reclassify' };
-  }
-
-  // Build prompt with constraint to use target category as top-level
-  const prompt = buildClassificationPrompt(bookmarksToReclassify, [targetCategory], {
-    depthMode: 'deep',
-  });
-  const response = await callCloudAPI(prompt, settings);
-  const directoryTree = parseClassificationResponse(response);
-
-  // Execute moves
-  const tree = await chrome.bookmarks.getTree();
-  const rootId = tree[0]?.children?.[0]?.id ?? '1';
-  let moved = 0;
-
-  for (const [path, bookmarkIds] of Object.entries(directoryTree)) {
-    const pathParts = path.split('/');
-    const folderId = await findOrCreateFolderPath(pathParts, rootId);
-
-    for (const bookmarkId of bookmarkIds) {
-      try {
-        await moveBookmark(bookmarkId, folderId);
-        moved++;
-      } catch (err) {
-        console.warn(`[BM] Failed to move bookmark ${bookmarkId}:`, err);
-      }
-    }
-  }
-
-  return { moved, total: bookmarksToReclassify.length };
-}
 
 // --- AI Connection Test ---
 

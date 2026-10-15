@@ -15,7 +15,6 @@ export type MessageRequest =
   | { type: 'ORGANIZE_AI_CLASSIFY_START'; bookmarkIds: readonly string[]; scope: 'global' | 'folder'; folderId?: string; categories?: readonly string[]; mode?: import('./types').OrganizeMode }
   | { type: 'ORGANIZE_AI_CLASSIFY_POLL'; taskId: string }
   | { type: 'ORGANIZE_EXECUTE'; directoryTree: Record<string, readonly string[]>; rootId: string }
-  | { type: 'ORGANIZE_RECLASSIFY'; sourceFolders: readonly string[]; targetCategory: string }
   | { type: 'GET_FOLDER_STRUCTURE' }
   | { type: 'GET_SETTINGS' }
   | { type: 'UPDATE_SETTINGS'; settings: Partial<import('./types').AppSettings> }
