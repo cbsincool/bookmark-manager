@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { normalizeDirectoryPath, parseClusterNamingResponse } from '../apiClient';
-import { normalizeSegment, suggestDirectoryName, visualLength } from '@/shared/directoryNaming';
+import { normalizeSegment, normalizeDirectoryPath as normalizePath, suggestDirectoryName, visualLength, INVISIBLE_CHARS } from '@/shared/directoryNaming';
 
 describe('normalizeDirectoryPath', () => {
   it('keeps a clean Chinese name unchanged', () => {
@@ -62,6 +62,33 @@ describe('normalizeDirectoryPath', () => {
     expect(normalizeDirectoryPath('户外/露营', 1)).toBe('户外');
     expect(normalizeDirectoryPath('编程/前端/ReactHooks', 2)).toBe('编程/前端');
     expect(normalizeDirectoryPath('编程/前端', 3)).toBe('编程/前端');
+  });
+
+  it('strips invisible characters that would otherwise pass through', () => {
+    // 零宽字符不在 JS 的 \s 范围内，会整串穿过所有基于空白的清洗。
+    // 危害在于看不出来——"React​Hooks" 和 "ReactHooks" 渲染一模一样。
+    const ZWSP = '​';
+    const SOFT_HYPHEN = '­';
+
+    expect(normalizeSegment(`React${ZWSP}Hooks`)).toBe('ReactHooks');
+    expect(normalizeSegment(`飞书${ZWSP}Backup Docs`)).toBe('飞书');
+    expect(normalizeSegment(`Soft${SOFT_HYPHEN}Hyphen`)).toBe('SoftHyphen');
+    expect(normalizeSegment(`Node.js${ZWSP}教程`)).toBe('Node.js');
+
+    // 整串都是不可见字符 → 清洗成空，该片段会被丢弃
+    expect(normalizeSegment(`${ZWSP}${SOFT_HYPHEN}`)).toBe('');
+    expect(normalizeDirectoryPath(`编程/${ZWSP}/前端`)).toBe('编程/前端');
+  });
+
+  it('leaves no invisible character in any corpus output', () => {
+    const corpus = [
+      'React​Hooks', '飞书​Backup Docs', 'A⁠B',
+      '﻿编程', 'Machine‌Learning Tutorial',
+    ];
+    for (const input of corpus) {
+      expect(INVISIBLE_CHARS.test(normalizeSegment(input)), `input=${JSON.stringify(input)}`).toBe(false);
+      INVISIBLE_CHARS.lastIndex = 0;
+    }
   });
 
   it('trims whitespace and edge punctuation from each segment', () => {
@@ -139,6 +166,11 @@ describe('suggestDirectoryName', () => {
 
   it('prefers the longer word when frequencies tie', () => {
     expect(suggestDirectoryName(['Kubernetes 与 k8s', 'Kubernetes 与 k8s'])).toBe('Kubernetes');
+  });
+
+  it('splits on invisible characters so they do not glue words together', () => {
+    // 不切开的话 "React​Hooks" 会成为一个词，清洗后得到小写的 "Reacthooks"
+    expect(suggestDirectoryName(['React​Hooks 教程'])).toBe('React');
   });
 
   it('falls back to 未分类 when nothing usable is found', () => {

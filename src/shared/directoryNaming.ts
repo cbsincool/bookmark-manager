@@ -18,6 +18,28 @@ import { GENERIC_NAME_WORDS } from './constants';
 export const MAX_VISUAL_LENGTH = 32;
 
 /**
+ * 不可见字符：零宽空格/连接符、双向文本控制符、软连字符等。
+ *
+ * 它们**不在 JS `\s` 的匹配范围内**，所以会整串穿过所有基于空白的清洗。
+ * 危害在于看不出来——`"React​Hooks"` 和 `"ReactHooks"` 渲染出来一模一样，
+ * 用户只会觉得「这个名字怎么改都不对」，排查时几乎不可能想到。
+ */
+export const INVISIBLE_CHARS = new RegExp(
+  '[' +
+  [
+    '\u00AD', // 软连字符
+    '\u180E', // 蒙古文元音分隔符
+    '\u200B-\u200F', // 零宽空格 / 零宽非连接符 / 零宽连接符 / LRM / RLM
+    '\u202A-\u202E', // 双向文本嵌入与覆盖
+    '\u2060-\u2064', // 词连接符 / 不可见运算符
+    '\u2066-\u2069', // 双向文本隔离
+    '\uFEFF', // 字节序标记
+  ].join('') +
+  ']',
+  'g',
+);
+
+/**
  * 片段首尾的装饰性标点。
  * 前导的 "." 是例外——".NET" 里的点是名称的一部分，只有连续的点且后面不是字母时才算垃圾。
  */
@@ -25,7 +47,8 @@ const LEADING_JUNK = /^[\s/\\|·、,，:：;；!！?？\-—_]+|^\.+(?![A-Za-z])
 const TRAILING_JUNK = /[\s/\\|·、,，.。:：;；!！?？\-—_]+$/;
 
 function trimEdgeJunk(raw: string): string {
-  let s = raw.replace(/\s+/g, ' ').trim();
+  // 先去不可见字符：它们会让下面的 `\s` 判定和 `trim()` 全部失准
+  let s = raw.replace(INVISIBLE_CHARS, '').replace(/\s+/g, ' ').trim();
   let previous: string;
   do {
     previous = s;
@@ -196,8 +219,15 @@ export function suggestDirectoryName(titles: readonly string[]): string {
 
   for (const title of titles) {
     // 也按 "/" 切分：否则 "React/Hooks 教程" 会整个成为一个词，产出的名字里带
-    // 斜杠，写进 directoryTree 的 key 后会被当成两级目录
-    for (const word of title.toLowerCase().split(/[\s\-_:\\/]+/)) {
+    // 斜杠，写进 directoryTree 的 key 后会被当成两级目录。
+    // 不可见字符同理——"React​Hooks" 不切开会粘成一个词，
+    // 清洗后得到小写的 "Reacthooks"
+    const words = title
+      .toLowerCase()
+      .split(/[\s\-_:\\/]+/)
+      .flatMap((chunk) => chunk.split(INVISIBLE_CHARS));
+
+    for (const word of words) {
       if (word.length < 2) continue;
       if (NAME_STOP_WORDS.has(word) || GENERIC_WORD_SET.has(word)) continue;
       if (!/^[a-zA-Z一-鿿]/.test(word)) continue;
