@@ -1,17 +1,16 @@
-import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder } from './bookmarkService';
+import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder, getExistingFolders, resolveMergeGroup, collectSubtreeBookmarkIds } from './bookmarkService';
 import { generateEmbedding, generateEmbeddingsBatch } from './embeddingClient';
 import { rerank } from './rerankerClient';
-import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL3, buildDedupGroups } from './dedupEngine';
-import { buildDomainClusters, computeDirectoryCohesion, computeDirectoryVector, buildSemanticClusters, computeOptimalK, assignToSkeleton, groupOverflow, mergeDirectoryTree } from './organizeEngine';
+import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2Content, scoreL3, buildDedupGroups } from './dedupEngine';
+import { buildDomainClusters, computeDirectoryCohesion, computeDirectoryVector, buildSemanticClusters, computeOptimalK, assignToSkeleton, groupOverflow, mergeDirectoryTree, buildSkeletonFromFolders, averageVectors } from './organizeEngine';
 import type { SkeletonNode, OverflowItem, SemanticCluster, OverflowGroup } from './organizeEngine';
 import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse, buildClusterNamingPrompt, parseClusterNamingResponse } from './apiClient';
 import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
 import { cosineSimilarity } from '@/shared/vectorSearch';
-import { extractDomain } from '@/shared/urlUtils';
 import { suggestDirectoryName } from '@/shared/directoryNaming';
-import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, ASSIGN_ACCEPT_THRESHOLD, MIN_SKELETON_CLUSTER_SIZE } from '@/shared/constants';
-import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats } from '@/shared/types';
+import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, ASSIGN_ACCEPT_THRESHOLD, MIN_SKELETON_CLUSTER_SIZE, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS } from '@/shared/constants';
+import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats, OrganizeMode } from '@/shared/types';
 import type { MessageRequest, MessageResponse, AsyncTask } from '@/shared/messageTypes';
 
 const db = new BookmarkDB();
@@ -108,7 +107,7 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
       return handleConnectivityCheck(msg.bookmarkIds);
 
     case 'ORGANIZE_AI_CLASSIFY_START':
-      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories);
+      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories, msg.mode);
 
     case 'ORGANIZE_AI_CLASSIFY_POLL':
       return handleAIClassifyPoll(msg.taskId);
@@ -142,15 +141,6 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
 
     case 'FINE_DEDUP_ANALYZE':
       return handleFineDedupAnalyze(msg.bookmarkIds);
-
-    case 'GET_CLASSIFIED_IDS':
-      return db.getAllClassifiedIds();
-
-    case 'DELETE_CLASSIFIED_MARK':
-      return db.deleteClassified(msg.bookmarkId);
-
-    case 'CLEAR_ALL_CLASSIFIED_MARKS':
-      return db.clearAllClassified();
 
     default:
       throw new Error(`Unknown message type: ${(msg as { type: string }).type}`);
@@ -270,18 +260,25 @@ async function handleDedupScan(): Promise<unknown> {
     l3Map.set(bm.id, scoreL3(bm));
   }
 
+  // L2 内容质量：只读**已缓存**的页面摘要，不发网络请求——扫描可能涉及上千条书签，
+  // 逐条抓取会让去重变得不可用。摘要在「精细去重」时被抓取并缓存，所以这一维会随
+  // 使用逐步生效；没有缓存的条目拿中性分，退化成 L1+L3。
+  const l2Map = new Map<string, number>();
+  for (const bm of dedupBookmarks) {
+    const cached = await db.getPageSummary(bm.id).catch(() => undefined);
+    l2Map.set(bm.id, scoreL2Content(cached?.summary));
+  }
+
   const scores = new Map<string, QualityScores>();
   for (const bm of dedupBookmarks) {
     scores.set(bm.id, {
-      l1: l1Map.get(bm.id) ?? 50,
-      l3: l3Map.get(bm.id) ?? 50,
+      l1: l1Map.get(bm.id) ?? NEUTRAL_SCORE,
+      l2: l2Map.get(bm.id) ?? NEUTRAL_SCORE,
+      l3: l3Map.get(bm.id) ?? NEUTRAL_SCORE,
     });
   }
 
-  const l1Weight = 0.5;
-  const l3Weight = 0.5;
-
-  const groups = buildDedupGroups(exactUrlGroups, sameTitleGroups, scores, l1Weight, l3Weight);
+  const groups = buildDedupGroups(exactUrlGroups, sameTitleGroups, scores, DEDUP_WEIGHTS);
 
   broadcastProgress('DEDUP_SCAN_PROGRESS', total, total, `扫描完成，发现 ${groups.length} 组重复`);
 
@@ -352,15 +349,23 @@ async function handleDedupManualForce(
   const bookmarks = await getAllBookmarks();
   const selected = bookmarks.filter((b) => bookmarkIds.includes(b.id));
 
-  const items: import('@/shared/types').DedupItem[] = selected.map((bm) => {
-    const l1 = scoreL1(bm.url);
-    const l3 = scoreL3(bm);
-    return {
-      bookmark: bm,
-      scores: { l1, l3 },
-      totalScore: l1 * 0.5 + l3 * 0.5,
+  const items: import('@/shared/types').DedupItem[] = [];
+  for (const bm of selected) {
+    const cached = await db.getPageSummary(bm.id).catch(() => undefined);
+    const scores = {
+      l1: scoreL1(bm.url),
+      l2: scoreL2Content(cached?.summary),
+      l3: scoreL3(bm),
     };
-  });
+    items.push({
+      bookmark: bm,
+      scores,
+      totalScore:
+        scores.l1 * DEDUP_WEIGHTS.l1 +
+        scores.l2 * DEDUP_WEIGHTS.l2 +
+        scores.l3 * DEDUP_WEIGHTS.l3,
+    });
+  }
 
   items.sort((a, b) => b.totalScore - a.totalScore);
   const group: import('@/shared/types').DedupGroup = {
@@ -592,6 +597,7 @@ async function handleAIClassifyStart(
   scope: 'global' | 'folder',
   folderId?: string,
   categories?: readonly string[],
+  mode: OrganizeMode = 'fit',
 ): Promise<{ taskId: string }> {
   const taskId = generateTaskId();
 
@@ -605,27 +611,32 @@ async function handleAIClassifyStart(
   const allBookmarks = await getAllBookmarks();
 
   let filtered: BookmarkNode[];
+  let mergedFolderNames: readonly string[] = [];
+
   if (scope === 'folder' && folderId) {
-    // Folder scope: find all bookmarks whose parent chain includes this folder
-    const targetFolder = await chrome.bookmarks.get(folderId).catch(() => [] as chrome.bookmarks.BookmarkTreeNode[]);
-    const folderTitle = targetFolder[0]?.title ?? '';
-    filtered = allBookmarks.filter((b) => b.path.includes(folderTitle) && !b.path.includes('[待删除_失效]'));
+    // 同级同义目录合并成一组处理（「工作」+「工作相关」）。原先用
+    // path.includes(标题) 做子串匹配，会跨层级误伤同名片段，且合并动作不可见。
+    const group = await resolveMergeGroup(folderId);
+    mergedFolderNames = group.names;
+
+    const memberIds = new Set<string>();
+    for (const id of group.ids) {
+      for (const bmId of await collectSubtreeBookmarkIds(id)) memberIds.add(bmId);
+    }
+
+    filtered = allBookmarks.filter(
+      (b) => memberIds.has(b.id) && !b.path.includes('[待删除_失效]'),
+    );
   } else {
     filtered = allBookmarks.filter((b) => !b.path.includes('[待删除_失效]'));
   }
 
-  // Global scope: skip already-classified bookmarks
-  let bookmarks: BookmarkNode[];
-  if (scope === 'global') {
-    const classifiedIds = await db.getAllClassifiedIds();
-    const classifiedSet = new Set(classifiedIds);
-    bookmarks = filtered.filter((b) => !classifiedSet.has(b.id));
-  } else {
-    // Folder scope: all bookmarks in folder participate regardless of classified status
-    bookmarks = filtered;
-  }
+  // 不再跳过「已归类」的书签。整理本来就该可以重复跑：骨架取自现有目录，
+  // 归得对的书签移动是空操作，归错的才会被纠正。此前靠标记跳过，导致第二次
+  // 全局整理拿到空集合、预览一片空白却没有任何提示。
+  const bookmarks = filtered;
 
-  processAIClassify(taskId, bookmarks, settings, scope, categories).catch((err) => {
+  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames).catch((err) => {
     console.error('[Organize] Task failed:', taskId, err);
     const task = asyncTasks.get(taskId);
     if (task) {
@@ -660,24 +671,6 @@ async function handleAIClassifyPoll(taskId: string): Promise<AsyncTask> {
  * 与所有目录都不像的书签才会触发新建目录。
  */
 
-/** 成员向量的均值，作为目录中心 */
-function averageVectors(vectors: readonly Float32Array[]): Float32Array {
-  const dim = vectors[0]?.length ?? 0;
-  const avg = new Float32Array(dim);
-  let used = 0;
-
-  for (const v of vectors) {
-    if (v.length !== dim) continue; // 维度不一致的陈旧向量直接跳过
-    for (let d = 0; d < dim; d++) avg[d] += v[d];
-    used++;
-  }
-
-  if (used > 0) {
-    for (let d = 0; d < dim; d++) avg[d] /= used;
-  }
-  return avg;
-}
-
 /**
  * 把聚类结果落成目录骨架。同名的簇合并成一个目录并重算中心——
  * AI 很容易给两个不同的簇起同一个名字。
@@ -707,6 +700,8 @@ interface NamingOutcome {
   readonly paths: Record<string, string>;
   /** 模型是否真的产出了可用命名（false = 静默退回了关键词命名） */
   readonly usedAi: boolean;
+  /** 失败原因。扩展的 service worker 日志在端到端脚本里抓不到，只能随结果带出来 */
+  readonly detail?: string;
 }
 
 /** 让 AI 给每个簇命名；AI 不可用或调用失败时退回关键词命名 */
@@ -723,30 +718,42 @@ async function nameClusters(
     fallback[String(i)] = cluster.topicName || `分类${i + 1}`;
   });
 
-  if (!canUseAI) return { paths: fallback, usedAi: false };
+  if (!canUseAI) return { paths: fallback, usedAi: false, detail: '未配置可用的模型' };
 
-  try {
-    const clusterInput = clusters.map((cluster, i) => ({
-      clusterId: String(i),
-      titles: cluster.bookmarkIds
-        .slice(0, 12)
-        .map((id) => titleById.get(id) ?? '')
-        .filter(Boolean),
-    }));
-    const raw = await callCloudAPI(
-      buildClusterNamingPrompt(clusterInput, maxDepth, userCategories),
-      settings,
-    );
-    const parsed = parseClusterNamingResponse(raw);
+  const clusterInput = clusters.map((cluster, i) => ({
+    clusterId: String(i),
+    titles: cluster.bookmarkIds
+      .slice(0, 12)
+      .map((id) => titleById.get(id) ?? '')
+      .filter(Boolean),
+  }));
+  const prompt = buildClusterNamingPrompt(clusterInput, maxDepth, userCategories);
 
-    // 模型可能只回了一部分簇，也可能回了一堆解析不出来的东西。
-    // 一个都没解析出来就算失败——否则用户会以为名字是模型起的。
-    const covered = clusters.filter((_, i) => parsed[String(i)]).length;
-    return { paths: { ...fallback, ...parsed }, usedAi: covered > 0 };
-  } catch (err) {
-    console.warn('[Organize] AI 命名失败，退回关键词命名:', err);
-    return { paths: fallback, usedAi: false };
+  // 模型偶尔会回一段散文而不是 JSON（实测约每几次出现一次），这种失败重试一次
+  // 基本就好了。不重试的话用户会莫名其妙地拿到关键词命名的结果。
+  const ATTEMPTS = 2;
+  let lastDetail = '';
+
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      const raw = await callCloudAPI(prompt, settings);
+      const parsed = parseClusterNamingResponse(raw);
+
+      // 模型可能只回了一部分簇，也可能回了一堆解析不出来的东西。
+      // 一个都没解析出来就算失败——否则用户会以为名字是模型起的。
+      const covered = clusters.filter((_, i) => parsed[String(i)]).length;
+      if (covered > 0) {
+        return { paths: { ...fallback, ...parsed }, usedAi: true };
+      }
+      lastDetail = `模型输出解析不出任何目录（${raw.length} 字符）: ${raw.trim().slice(0, 150)}`;
+    } catch (err) {
+      console.warn(`[Organize] AI 命名第 ${attempt} 次失败:`, err);
+      lastDetail = String(err).slice(0, 300);
+    }
   }
+
+  console.warn('[Organize] AI 命名失败，退回关键词命名:', lastDetail);
+  return { paths: fallback, usedAi: false, detail: lastDetail };
 }
 
 /** 给溢出新建的目录命名。它们是平级目录，所以深度固定为 1 */
@@ -764,7 +771,8 @@ async function nameOverflowGroups(
       titles: group.titles.slice(0, 12),
     }));
     const raw = await callCloudAPI(buildClusterNamingPrompt(clusterInput, 1), settings);
-    const parsed = parseClusterNamingResponse(raw);
+    // 强制 1 层：模型偶尔会无视 prompt 里的深度约束，回出 "户外/露营" 这种两层路径
+    const parsed = parseClusterNamingResponse(raw, 1);
     return groups.map((_, i) => parsed[String(i)] || fallback[i]);
   } catch (err) {
     console.warn('[Organize] 溢出目录命名失败，退回关键词命名:', err);
@@ -776,8 +784,9 @@ async function processAIClassify(
   taskId: string,
   bookmarks: readonly BookmarkNode[],
   settings: AppSettings,
-  scope: 'global' | 'folder',
+  mode: OrganizeMode,
   userCategories?: readonly string[],
+  mergedFolderNames: readonly string[] = [],
 ): Promise<void> {
   const task = asyncTasks.get(taskId);
   if (!task) return;
@@ -793,7 +802,14 @@ async function processAIClassify(
     stats: OrganizeStats,
   ) => {
     task.status = 'completed';
-    task.result = { directoryTree, lowCohesionPaths: [], skeletonPaths, overflowPaths, stats };
+    task.result = {
+      directoryTree,
+      lowCohesionPaths: [],
+      skeletonPaths,
+      overflowPaths,
+      mergedFolderNames,
+      stats,
+    };
   };
 
   const statsFor = (overrides: Partial<OrganizeStats>): OrganizeStats => ({
@@ -843,7 +859,7 @@ async function processAIClassify(
 
     // 书签太少，聚类没有意义
     if (vectors.length < 4) {
-      finish({ '未分类': bookmarks.map((b) => b.id) }, [], [], statsFor({}));
+      finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
       return;
     }
 
@@ -851,37 +867,64 @@ async function processAIClassify(
       settings.apiEndpoint && (settings.apiFormat === 'anthropic' || settings.apiKey),
     );
 
-    // --- 阶段 1：全量定骨架 ---
-    const k = computeOptimalK(vectors.length);
-    updateProgress(0, total, `语义聚类中 (k=${k})`);
-    const clusters = buildSemanticClusters(vectors, [...bookmarks], k, {
-      minClusterSize: MIN_SKELETON_CLUSTER_SIZE,
-    });
+    // --- 阶段 1：定骨架 ---
+    // fit（默认）：骨架取自**现有目录结构**。归得对的书签自然匹配到自己所在的目录，
+    //   移动变成空操作；归错的才会匹配到别处从而被移走。「正确的不动、错误的被纠正」
+    //   由此结构性成立，不靠任何「已归类」记账，重复整理也就安全了。
+    // replan：每次重新聚类生成骨架，目录结构会重构（推倒重来的场景）。
+    let skeleton: SkeletonNode[] = [];
 
-    if (clusters.length === 0) {
-      finish({ '未分类': bookmarks.map((b) => b.id) }, [], [], statsFor({}));
-      return;
+    if (mode === 'fit') {
+      const rootFolderId = await getRootFolderId();
+      const folders = await getExistingFolders(rootFolderId);
+      const usable = folders.filter(
+        (f) =>
+          f.bookmarkIds.length > 0 &&
+          f.path !== UNCLASSIFIED_DIR &&
+          !f.path.includes('[待删除_失效]'),
+      );
+      updateProgress(0, usable.length, `读取现有目录 (${usable.length} 个)`);
+      skeleton = buildSkeletonFromFolders(usable, vectorMap);
     }
 
-    updateProgress(0, clusters.length, `AI 命名中 (0/${clusters.length})`);
-    const naming = await nameClusters(
-      clusters,
-      titleById,
-      settings,
-      canUseAI,
-      userCategories,
-      settings.organizeMaxDepth ?? 3,
-    );
-    updateProgress(clusters.length, clusters.length, 'AI 命名完成');
+    // 没有可用目录（首次整理）或用户选择重新规划 → 退回聚类生成骨架
+    let namedWithAi: boolean | null = null;
+    let namingDetail: string | undefined;
 
-    let skeleton = buildSkeleton(clusters, naming.paths, vectorMap);
+    if (skeleton.length === 0) {
+      const k = computeOptimalK(vectors.length);
+      updateProgress(0, total, `语义聚类中 (k=${k})`);
+      const clusters = buildSemanticClusters(vectors, [...bookmarks], k, {
+        minClusterSize: MIN_SKELETON_CLUSTER_SIZE,
+      });
 
-    // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
-    // 必须用相对书签栏的路径比对——findOrCreateFolderPath 的基准是书签栏，
-    // getAllDirectoryPaths 产出的是带「书签栏」前缀的路径，两者对不上。
-    if (settings.onlyUseExistingDirectories) {
-      const existing = new Set(await getDirectoryPathsUnder(await getRootFolderId()));
-      skeleton = skeleton.filter((node) => existing.has(node.path));
+      if (clusters.length === 0) {
+        finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
+        return;
+      }
+
+      updateProgress(0, clusters.length, `AI 命名中 (0/${clusters.length})`);
+      const naming = await nameClusters(
+        clusters,
+        titleById,
+        settings,
+        canUseAI,
+        userCategories,
+        settings.organizeMaxDepth ?? 3,
+      );
+      updateProgress(clusters.length, clusters.length, 'AI 命名完成');
+      namedWithAi = naming.usedAi;
+      namingDetail = naming.detail;
+
+      skeleton = buildSkeleton(clusters, naming.paths, vectorMap);
+
+      // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
+      // 必须用相对书签栏的路径比对——findOrCreateFolderPath 的基准是书签栏，
+      // getAllDirectoryPaths 产出的是带「书签栏」前缀的路径，两者对不上。
+      if (settings.onlyUseExistingDirectories) {
+        const existing = new Set(await getDirectoryPathsUnder(await getRootFolderId()));
+        skeleton = skeleton.filter((node) => existing.has(node.path));
+      }
     }
 
     // --- 阶段 2：逐条归位 ---
@@ -901,7 +944,7 @@ async function processAIClassify(
           const vector = vectorMap.get(id);
           const bookmark = bookmarks.find((b) => b.id === id);
           if (!vector || !bookmark) return null;
-          return { id, vector, title: bookmark.title, domain: extractDomain(bookmark.url) };
+          return { id, vector, title: bookmark.title };
         })
         .filter((item): item is OverflowItem => item !== null);
 
@@ -932,15 +975,17 @@ async function processAIClassify(
       overflow: assignment.overflowIds.length,
       overflowDirectories: overflowEntries.length,
       unassigned: unassignedIds.length,
-      warning: assignment.warning
-        ?? (canUseAI ? (naming.usedAi ? undefined : 'ai-naming-failed') : 'ai-unavailable'),
+      warning:
+        assignment.warning ??
+        (namedWithAi === null
+          ? undefined
+          : namedWithAi
+            ? undefined
+            : canUseAI
+              ? 'ai-naming-failed'
+              : 'ai-unavailable'),
+      warningDetail: namingDetail,
     });
-
-    // 已归类标记覆盖全部参与整理的书签（含溢出与未分类）
-    const now = Date.now();
-    for (const bm of bookmarks) {
-      await db.putClassified(bm.id, now).catch(() => {});
-    }
 
     finish(
       directoryTree,
@@ -992,8 +1037,6 @@ async function handleOrganizeExecute(
         await moveBookmark(bookmarkId, folderId);
         if (sourceId && sourceId !== folderId) emptied.add(sourceId);
         moved++;
-        // Mark as classified after successful move
-        await db.putClassified(bookmarkId, Date.now()).catch(() => {});
       } catch (err) {
         console.warn(`[BM] Failed to move bookmark ${bookmarkId}:`, err);
       }
@@ -1287,15 +1330,6 @@ chrome.bookmarks.onChanged.addListener(async (id, changeInfo) => {
 chrome.bookmarks.onRemoved.addListener(async (id) => {
   await db.deleteVector(id);
   await db.deletePageSummary(id).catch(() => {});
-  await db.deleteClassified(id).catch(() => {});
-});
-
-chrome.bookmarks.onMoved.addListener(async (id) => {
-  try {
-    await db.putClassified(id, Date.now());
-  } catch (err) {
-    console.error('[BM] Failed to mark classified on move:', err);
-  }
 });
 
 // --- Install handler ---

@@ -166,10 +166,17 @@ export function normalizeSegment(raw: string): string {
   return capSegment(joinedLatin);
 }
 
-/** 清洗整条目录路径，丢弃清洗后为空的片段与连续重复段 */
-export function normalizeDirectoryPath(path: string): string {
+/**
+ * 清洗整条目录路径，丢弃清洗后为空的片段与连续重复段。
+ *
+ * `maxDepth` 用于强制层级上限：模型并不总会遵守 prompt 里的深度约束
+ * （实测让它给 1 层的溢出目录命名时，偶尔会回 "户外/露营" 这种两层路径）。
+ * 超限时**保留前几层**——模型把更泛的概念放在前面，截前缀比截后缀更接近原意。
+ */
+export function normalizeDirectoryPath(path: string, maxDepth?: number): string {
   const segments = path.split('/').map(normalizeSegment).filter(Boolean);
-  return segments.filter((s, i) => i === 0 || s !== segments[i - 1]).join('/');
+  const deduped = segments.filter((s, i) => i === 0 || s !== segments[i - 1]);
+  return (maxDepth ? deduped.slice(0, maxDepth) : deduped).join('/');
 }
 
 const NAME_STOP_WORDS = new Set([

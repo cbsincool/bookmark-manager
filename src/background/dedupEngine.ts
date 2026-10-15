@@ -1,6 +1,29 @@
 import type { BookmarkNode, DedupGroup, DedupItem, QualityScores } from '@/shared/types';
 import { normalizeUrl, type NormalizeOptions } from '@/shared/urlUtils';
-import { WELL_KNOWN_DOMAINS, LOW_INFO_TITLES } from '@/shared/constants';
+import {
+  WELL_KNOWN_DOMAINS,
+  LOW_INFO_TITLES,
+  NEUTRAL_SCORE,
+  SHORT_SUMMARY_LENGTH,
+  RICH_SUMMARY_LENGTH,
+} from '@/shared/constants';
+
+/** 三维权重 */
+export interface DedupWeights {
+  readonly l1: number;
+  readonly l2: number;
+  readonly l3: number;
+}
+
+const NEUTRAL_SCORES: QualityScores = {
+  l1: NEUTRAL_SCORE,
+  l2: NEUTRAL_SCORE,
+  l3: NEUTRAL_SCORE,
+};
+
+function weightedScore(scores: QualityScores, weights: DedupWeights): number {
+  return scores.l1 * weights.l1 + scores.l2 * weights.l2 + scores.l3 * weights.l3;
+}
 
 export function findExactUrlDuplicates(
   bookmarks: readonly BookmarkNode[],
@@ -82,79 +105,24 @@ export function scoreL1(url: string): number {
 }
 
 /**
- * L2: Structure density score - evaluates URL structure quality without network requests.
- * Focuses on content indicators from URL structure:
- * - Path depth and semantic meaningfulness
- * - Document/article indicators vs generic pages
- * - Content-rich URL patterns
+ * L2: 内容质量分 —— 用**已缓存**的页面摘要判断这条书签指向的页面有没有实质内容。
+ *
+ * 刻意不发网络请求：一次全库扫描可能涉及上千条书签，逐条抓取会让去重变得不可用。
+ * 摘要在「精细去重」时被抓取并缓存，所以这里的数据会随着使用逐步积累——
+ * 跑过一次精细去重之后，自动推荐保留哪一条会明显更准；没跑过则一律中性分，
+ * 不奖不罚，退化成 L1+L3 两维。
+ *
+ * 这一维和精细去重里的 AI 重叠度分析不重复：那个判断「哪两条讲的是同一件事」，
+ * 这个只判断「这一条的页面里到底有没有东西」。
  */
-export function scoreL2(url: string): number {
-  let score = 50; // base
+export function scoreL2Content(summary: string | undefined): number {
+  if (summary === undefined) return NEUTRAL_SCORE; // 没有缓存
 
-  try {
-    const parsed = new URL(url);
-    const pathname = parsed.pathname;
-    const hostname = parsed.hostname;
-
-    // Path depth - deeper paths often indicate specific content
-    const pathSegments = pathname.split('/').filter((s) => s.length > 0);
-    if (pathSegments.length >= 2 && pathSegments.length <= 4) {
-      score += 10; // Good depth for content pages
-    } else if (pathSegments.length > 4) {
-      score -= 5; // Too deep, might be nested navigation
-    }
-
-    // Document/content indicators in path
-    const docPatterns = [
-      /\/docs?\//i, /\/guide/i, /\/tutorial/i, /\/learn\//i,
-      /\/api\//i, /\/reference\//i, /\/manual\//i,
-      /\/blog\//i, /\/article\//i, /\/post\//i,
-      /\/wiki\//i, /\/book\//i, /\/course\//i,
-    ];
-    if (docPatterns.some((p) => p.test(pathname))) {
-      score += 15;
-    }
-
-    // Generic/homepage indicators - lower score
-    const genericPatterns = [
-      /^\/$/, /^\/(index|home|main|default)\.?(html|php|asp)?$/i,
-      /^\/(category|tag|archive|search)$/i,
-    ];
-    if (genericPatterns.some((p) => p.test(pathname))) {
-      score -= 20;
-    }
-
-    // File extension - specific formats often indicate documents
-    if (/\.(pdf|md|txt|html|htm)$/i.test(pathname)) {
-      score += 10;
-    }
-
-    // Query string with meaningful content indicators
-    const searchParams = parsed.searchParams;
-    const hasContentParam = searchParams.has('id') || searchParams.has('page') ||
-                           searchParams.has('article') || searchParams.has('post');
-    if (hasContentParam && pathSegments.length === 0) {
-      score += 5; // Content via query params is OK but not ideal
-    }
-
-    // Subdomain indicating specific content area
-    const subdomain = hostname.split('.')[0];
-    const contentSubdomains = ['docs', 'doc', 'guide', 'learn', 'api', 'dev', 'blog', 'help', 'support', 'wiki'];
-    if (contentSubdomains.includes(subdomain.toLowerCase())) {
-      score += 10;
-    }
-
-  } catch {
-    // Invalid URL
-    score -= 10;
-  }
-
-  return Math.max(0, Math.min(100, score));
-}
-
-/** Run scoreL2 for multiple URLs (synchronous since no network requests). */
-export function scoreL2Batch(urls: string[]): number[] {
-  return urls.map((url) => scoreL2(url));
+  const text = summary.trim();
+  if (text.length === 0) return 20; // 抓过但拿不到内容：登录墙 / 空壳页
+  if (text.length < SHORT_SUMMARY_LENGTH) return 40;
+  if (text.length < RICH_SUMMARY_LENGTH) return 60;
+  return 75;
 }
 
 /**
@@ -191,18 +159,17 @@ export function buildDedupGroups(
   exactUrlGroups: { items: BookmarkNode[] }[],
   sameTitleGroups: { title: string; items: BookmarkNode[] }[],
   scores: Map<string, QualityScores>,
-  l1Weight: number,
-  l3Weight: number,
+  weights: DedupWeights,
 ): DedupGroup[] {
   const groups: DedupGroup[] = [];
 
   for (const group of exactUrlGroups) {
     const items: DedupItem[] = group.items.map((bm) => {
-      const s = scores.get(bm.id) ?? { l1: 50, l3: 50 };
+      const s = scores.get(bm.id) ?? NEUTRAL_SCORES;
       return {
         bookmark: bm,
         scores: s,
-        totalScore: s.l1 * l1Weight + s.l3 * l3Weight,
+        totalScore: weightedScore(s, weights),
       };
     });
     items.sort((a, b) => b.totalScore - a.totalScore);
@@ -216,11 +183,11 @@ export function buildDedupGroups(
 
   for (const group of sameTitleGroups) {
     const items: DedupItem[] = group.items.map((bm) => {
-      const s = scores.get(bm.id) ?? { l1: 50, l3: 50 };
+      const s = scores.get(bm.id) ?? NEUTRAL_SCORES;
       return {
         bookmark: bm,
         scores: s,
-        totalScore: s.l1 * l1Weight + s.l3 * l3Weight,
+        totalScore: weightedScore(s, weights),
       };
     });
     items.sort((a, b) => b.totalScore - a.totalScore);

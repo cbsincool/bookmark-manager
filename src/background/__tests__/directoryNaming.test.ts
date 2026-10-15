@@ -56,6 +56,14 @@ describe('normalizeDirectoryPath', () => {
     expect(normalizeDirectoryPath('...')).toBe('');
   });
 
+  it('enforces a depth limit when one is given', () => {
+    // 模型并不总遵守 prompt 里的深度约束：让溢出目录命名只出 1 层，
+    // 实测偶尔会回 "户外/露营"。超限时保留前几层——模型把更泛的概念放前面。
+    expect(normalizeDirectoryPath('户外/露营', 1)).toBe('户外');
+    expect(normalizeDirectoryPath('编程/前端/ReactHooks', 2)).toBe('编程/前端');
+    expect(normalizeDirectoryPath('编程/前端', 3)).toBe('编程/前端');
+  });
+
   it('trims whitespace and edge punctuation from each segment', () => {
     expect(normalizeDirectoryPath('  编程 / 前端  ')).toBe('编程/前端');
     expect(normalizeDirectoryPath('工具/效率/')).toBe('工具/效率');

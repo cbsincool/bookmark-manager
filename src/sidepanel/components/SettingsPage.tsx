@@ -53,8 +53,6 @@ export function SettingsPage() {
   const [testResult, setTestResult] = useState<string | null>(null);
   const [isTesting, setIsTesting] = useState(false);
   const [isRebuilding, setIsRebuilding] = useState(false);
-  const [isClearingClassified, setIsClearingClassified] = useState(false);
-  const [clearClassifiedMsg, setClearClassifiedMsg] = useState<string | null>(null);
 
   const { progress: rebuildProgress } = useProgressListener('REBUILD_INDEX_PROGRESS');
 
@@ -110,23 +108,6 @@ export function SettingsPage() {
       await refreshStats();
     } finally {
       setIsRebuilding(false);
-    }
-  };
-
-  const handleClearClassified = async () => {
-    setIsClearingClassified(true);
-    setClearClassifiedMsg(null);
-    try {
-      const resp = await chrome.runtime.sendMessage({ type: 'CLEAR_ALL_CLASSIFIED_MARKS' });
-      if (resp?.success) {
-        setClearClassifiedMsg('✅ 归类标记已全部清除');
-      } else {
-        setClearClassifiedMsg(`❌ ${resp?.error ?? '清除失败'}`);
-      }
-    } catch (err) {
-      setClearClassifiedMsg(`❌ ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setIsClearingClassified(false);
     }
   };
 
@@ -230,19 +211,6 @@ export function SettingsPage() {
           />
           <span className="text-xs text-gray-400">{t('settings.organize.maxDepthHint')}</span>
         </label>
-        <div className="space-y-1">
-          <button
-            onClick={handleClearClassified}
-            disabled={isClearingClassified}
-            className="px-3 py-1.5 text-xs border border-orange-300 text-orange-600 rounded-lg hover:bg-orange-50 disabled:opacity-50"
-          >
-            {isClearingClassified ? '清除中...' : t('settings.organize.clearClassified')}
-          </button>
-          {clearClassifiedMsg && (
-            <p className="text-xs text-gray-500">{clearClassifiedMsg}</p>
-          )}
-          <p className="text-xs text-gray-400">{t('settings.organize.clearClassifiedHint')}</p>
-        </div>
       </Section>
 
       <Section title={t('settings.dedup.title')}>

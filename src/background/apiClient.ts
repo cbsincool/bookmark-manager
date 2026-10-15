@@ -469,7 +469,7 @@ export interface ClusterNamingResult {
   [clusterId: string]: string;
 }
 
-export function parseClusterNamingResponse(raw: string): ClusterNamingResult {
+export function parseClusterNamingResponse(raw: string, maxDepth?: number): ClusterNamingResult {
   try {
     const jsonMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
     const jsonStr = jsonMatch ? jsonMatch[1].trim() : raw.trim();
@@ -478,7 +478,7 @@ export function parseClusterNamingResponse(raw: string): ClusterNamingResult {
       const out: ClusterNamingResult = {};
       for (const [clusterId, path] of Object.entries(parsed as Record<string, unknown>)) {
         if (typeof path !== 'string') continue;
-        const normalized = normalizeDirectoryPath(path);
+        const normalized = normalizeDirectoryPath(path, maxDepth);
         if (normalized) out[clusterId] = normalized;
       }
       return out;

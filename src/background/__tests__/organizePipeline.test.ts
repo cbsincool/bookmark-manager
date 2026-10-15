@@ -8,6 +8,7 @@ import {
 } from '../organizeEngine';
 import type { SkeletonNode, OverflowItem } from '../organizeEngine';
 import type { BookmarkNode } from '@/shared/types';
+import { MAX_NEW_DIRS_CAP } from '@/shared/constants';
 
 const vec = (...values: number[]): Float32Array => new Float32Array(values);
 
@@ -24,11 +25,10 @@ const node = (path: string, centroid: Float32Array): SkeletonNode => ({
   isOverflow: false,
 });
 
-const item = (id: string, vector: Float32Array, domain = 'example.com'): OverflowItem => ({
+const item = (id: string, vector: Float32Array): OverflowItem => ({
   id,
   vector,
   title: id,
-  domain,
 });
 
 const bm = (id: string, title: string): BookmarkNode => ({
@@ -172,14 +172,15 @@ describe('groupOverflow', () => {
   });
 
   it('does not create one directory per bookmark', () => {
-    // 20 条互不相似的书签——逐条建目录会得到 20 个碎片目录
+    // 20 条互不相似的书签——逐条建目录会得到 20 个碎片目录，硬上限兜住
     const items = Array.from({ length: 20 }, (_, i) =>
       item(`v${i}`, unit(...Array.from({ length: 20 }, (_, d) => (d === i ? 1 : 0.01)))),
     );
     const result = groupOverflow(items);
 
-    expect(result.groups.length).toBeLessThanOrEqual(4);
-    expect(result.groups.length + result.unassignedIds.length).toBeGreaterThan(0);
+    expect(result.groups.length).toBeLessThanOrEqual(MAX_NEW_DIRS_CAP);
+    expect(result.groups.length).toBeLessThan(items.length);
+    expect(result.groups.length + result.unassignedIds.length).toBe(items.length);
   });
 
   it('groups a tight cluster of bookmarks into one directory', () => {
@@ -204,6 +205,30 @@ describe('groupOverflow', () => {
 
     const seen = [...result.groups.flatMap((g) => g.ids), ...result.unassignedIds];
     expect(seen.sort()).toEqual(items.map((i) => i.id).sort());
+  });
+
+  it('gives a lone outlier its own directory', () => {
+    const result = groupOverflow([item('solo', unit(1, 0, 0, 0))]);
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0].ids).toEqual(['solo']);
+  });
+
+  it('is monotonic: two dissimilar outliers get two directories, not zero', () => {
+    // 此前 1 条会建目录、2 条反而不建（单条簇豁免 + 两条簇被凝聚度解散），
+    // 数量多了结果反而更差
+    const two = groupOverflow([item('x', unit(1, 0, 0, 0)), item('y', unit(0, 1, 0, 0))]);
+    expect(two.groups).toHaveLength(2);
+    expect(two.groups.map((g) => g.ids[0]).sort()).toEqual(['x', 'y']);
+    expect(two.unassignedIds).toEqual([]);
+  });
+
+  it('keeps two similar outliers together in one directory', () => {
+    const result = groupOverflow([
+      item('a1', unit(1, 0.01, 0, 0)),
+      item('a2', unit(1, 0.02, 0, 0)),
+    ]);
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0].ids).toHaveLength(2);
   });
 
   it('carries the titles of each group through for naming', () => {

@@ -12,14 +12,11 @@ export type MessageRequest =
   | { type: 'ORGANIZE_DOMAIN_CLUSTER' }
   | { type: 'ORGANIZE_SEMANTIC_CLUSTER'; bookmarkIds: readonly string[] }
   | { type: 'ORGANIZE_CONNECTIVITY_CHECK'; bookmarkIds: readonly string[] }
-  | { type: 'ORGANIZE_AI_CLASSIFY_START'; bookmarkIds: readonly string[]; scope: 'global' | 'folder'; folderId?: string; categories?: readonly string[] }
+  | { type: 'ORGANIZE_AI_CLASSIFY_START'; bookmarkIds: readonly string[]; scope: 'global' | 'folder'; folderId?: string; categories?: readonly string[]; mode?: import('./types').OrganizeMode }
   | { type: 'ORGANIZE_AI_CLASSIFY_POLL'; taskId: string }
   | { type: 'ORGANIZE_EXECUTE'; directoryTree: Record<string, readonly string[]>; rootId: string }
   | { type: 'ORGANIZE_RECLASSIFY'; sourceFolders: readonly string[]; targetCategory: string }
   | { type: 'GET_FOLDER_STRUCTURE' }
-  | { type: 'GET_CLASSIFIED_IDS' }
-  | { type: 'DELETE_CLASSIFIED_MARK'; bookmarkId: string }
-  | { type: 'CLEAR_ALL_CLASSIFIED_MARKS' }
   | { type: 'GET_SETTINGS' }
   | { type: 'UPDATE_SETTINGS'; settings: Partial<import('./types').AppSettings> }
   | { type: 'TEST_AI_CONNECTION' }

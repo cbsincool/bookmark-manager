@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { DomainCluster, OrganizeProposal } from '@/shared/types';
+import type { DomainCluster, OrganizeProposal, OrganizeMode } from '@/shared/types';
 
 type WizardStep = 'idle' | 'scope' | 'category' | 'connectivity' | 'domain' | 'classify' | 'preview';
 type OrganizeScope = 'global' | 'folder';
@@ -7,6 +7,7 @@ type OrganizeScope = 'global' | 'folder';
 interface OrganizeState {
   readonly step: WizardStep;
   readonly organizeScope: OrganizeScope;
+  readonly organizeMode: OrganizeMode;
   readonly organizeFolderId: string;
   readonly organizeFolderName: string;
   readonly domainClusters: readonly DomainCluster[];
@@ -16,6 +17,7 @@ interface OrganizeState {
   readonly connectivityDeadCount: number;
   readonly setStep: (s: WizardStep) => void;
   readonly setOrganizeScope: (s: OrganizeScope, folderId?: string, folderName?: string) => void;
+  readonly setOrganizeMode: (m: OrganizeMode) => void;
   readonly setDomainClusters: (c: DomainCluster[]) => void;
   readonly toggleDomainCluster: (domain: string) => void;
   readonly updateFolderName: (domain: string, name: string) => void;
@@ -31,6 +33,7 @@ interface OrganizeState {
 export const useOrganizeStore = create<OrganizeState>((set, get) => ({
   step: 'idle',
   organizeScope: 'global',
+  organizeMode: 'fit',
   organizeFolderId: '',
   organizeFolderName: '',
   domainClusters: [],
@@ -41,6 +44,7 @@ export const useOrganizeStore = create<OrganizeState>((set, get) => ({
   setStep: (step) => set({ step }),
   setOrganizeScope: (organizeScope, organizeFolderId = '', organizeFolderName = '') =>
     set({ organizeScope, organizeFolderId, organizeFolderName }),
+  setOrganizeMode: (organizeMode) => set({ organizeMode }),
   setDomainClusters: (domainClusters) => set({ domainClusters }),
   toggleDomainCluster: (domain) => {
     const clusters = get().domainClusters.map((c) =>
@@ -73,6 +77,7 @@ export const useOrganizeStore = create<OrganizeState>((set, get) => ({
   reset: () => set({
     step: 'idle',
     organizeScope: 'global',
+    organizeMode: 'fit',
     organizeFolderId: '',
     organizeFolderName: '',
     domainClusters: [],

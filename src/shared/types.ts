@@ -70,8 +70,10 @@ export interface DedupItem {
   readonly totalScore: number;
 }
 
+/** 去重评分三维：URL 表层 / 内容质量 / 元数据。各管一件事，互不重叠 */
 export interface QualityScores {
   readonly l1: number;
+  readonly l2: number;
   readonly l3: number;
 }
 
@@ -85,6 +87,14 @@ export interface DomainCluster {
   readonly hasPortal: boolean;
 }
 
+/**
+ * 整理模式。
+ * - `fit`（默认）：骨架取自现有目录结构。归得对的书签移动是空操作，归错的才会被移走，
+ *   所以可以反复整理而不会来回搬动。
+ * - `replan`：每次重新聚类生成目录骨架，会重构目录结构——推倒重来的场景。
+ */
+export type OrganizeMode = 'fit' | 'replan';
+
 /** 整理结果统计，供预览页展示归位质量 */
 export interface OrganizeStats {
   readonly total: number;
@@ -95,6 +105,8 @@ export interface OrganizeStats {
   readonly unassigned: number;
   readonly acceptThreshold: number;
   readonly warning?: 'threshold-too-high' | 'vector-dim-mismatch' | 'ai-unavailable' | 'ai-naming-failed';
+  /** 告警的具体原因（例如 AI 调用的原始错误），用于排查——后台日志在扩展里看不见 */
+  readonly warningDetail?: string;
 }
 
 export interface OrganizeProposal {
@@ -104,6 +116,8 @@ export interface OrganizeProposal {
   readonly skeletonPaths?: readonly string[];
   /** 由溢出书签新建的目录路径 */
   readonly overflowPaths?: readonly string[];
+  /** 本次一起整理的「同级同义目录」名字（文件夹范围整理时才会有） */
+  readonly mergedFolderNames?: readonly string[];
   readonly stats?: OrganizeStats;
 }
 
@@ -124,12 +138,6 @@ export interface AppSettings {
   readonly urlNormStripHash: boolean;
   readonly language: 'en' | 'zh';
   readonly topLevelCategories: readonly string[];
-}
-
-// 已归类书签标记
-export interface ClassifiedBookmark {
-  readonly id: string;
-  readonly classifiedAt: number;
 }
 
 // 页面摘要缓存（精细去重用）

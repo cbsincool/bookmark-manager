@@ -7,9 +7,8 @@ import {
   ASSIGN_ACCEPT_THRESHOLD,
   OVERFLOW_ACCEPT_RATIO,
   OVERFLOW_COHESION_MIN,
-  MIN_FRAGMENT_FOR_DIR,
-  DOMAIN_FALLBACK_MIN,
   maxNewDirectories,
+  UNCLASSIFIED_DIR,
 } from '@/shared/constants';
 
 /**
@@ -290,6 +289,58 @@ export interface AssignmentBucket {
   readonly ids: readonly string[];
 }
 
+/** 成员向量的均值，作为目录中心 */
+export function averageVectors(vectors: readonly Float32Array[]): Float32Array {
+  const dim = vectors[0]?.length ?? 0;
+  const avg = new Float32Array(dim);
+  let used = 0;
+
+  for (const v of vectors) {
+    if (v.length !== dim) continue; // 维度不一致的陈旧向量直接跳过
+    for (let d = 0; d < dim; d++) avg[d] += v[d];
+    used++;
+  }
+
+  if (used > 0) {
+    for (let d = 0; d < dim; d++) avg[d] /= used;
+  }
+  return avg;
+}
+
+/**
+ * 以**现有目录结构**为骨架。
+ *
+ * 这是「重复整理安全」的关键。若骨架来自每次重新聚类，连目标目录本身都会变，
+ * 书签必然被大规模搬动——原来的「已归类标记」只是给这个不稳定性打的补丁。
+ * 改用现有目录做骨架后：归得对的书签自然匹配到自己所在的目录，移动变成空操作；
+ * 归错的才会匹配到别的目录从而被移走。「正确的不动、错误的被纠正」是结构上
+ * 必然成立的，不靠任何记账。
+ *
+ * 空目录与还没有向量的目录直接跳过（它们没法参与相似度比对）。
+ */
+export function buildSkeletonFromFolders(
+  folders: readonly { readonly path: string; readonly bookmarkIds: readonly string[] }[],
+  vectorMap: ReadonlyMap<string, Float32Array>,
+): SkeletonNode[] {
+  const nodes: SkeletonNode[] = [];
+
+  for (const folder of folders) {
+    const vectors = folder.bookmarkIds
+      .map((id) => vectorMap.get(id))
+      .filter((v): v is Float32Array => v !== undefined);
+    if (vectors.length === 0) continue;
+
+    nodes.push({
+      path: folder.path,
+      memberIds: folder.bookmarkIds,
+      centroid: averageVectors(vectors),
+      isOverflow: false,
+    });
+  }
+
+  return nodes;
+}
+
 export interface AssignResult {
   readonly assigned: readonly AssignmentBucket[];
   readonly overflowIds: readonly string[];
@@ -370,7 +421,6 @@ export interface OverflowItem {
   readonly id: string;
   readonly vector: Float32Array;
   readonly title: string;
-  readonly domain: string;
 }
 
 export interface OverflowGroup {
@@ -386,13 +436,14 @@ export interface OverflowResult {
 /**
  * 阶段三：为溢出的书签成组建目录。
  *
- * 用户要的行为是「内容不同的网页，重新生成一个文件夹放进去」，
- * 但逐条建目录会产生一堆只有一条书签的碎片目录。这里用四道闸门收敛：
+ * 用户要的行为是「内容不同的网页，重新生成一个文件夹放进去」。这里用两道闸门收敛：
  *   ① 二次聚类的簇数有硬上限（`maxNewDirectories`）
- *   ② 多条簇的凝聚度低于 `OVERFLOW_COHESION_MIN` 视为硬凑，解散为碎片
- *   ③ 碎片池不足 `MIN_FRAGMENT_FOR_DIR` 条就不做域名兜底
- *   ④ 碎片按域名成组，同域名少于 `DOMAIN_FALLBACK_MIN` 条的不建目录
- * 最终落选的条目由调用方并入「未分类」。
+ *   ② 凝聚度低于 `OVERFLOW_COHESION_MIN` 的簇视为硬凑，**拆成单条各自成组**
+ * 最终组数超上限时按规模降序保留，落选的条目由调用方并入「未分类」。
+ *
+ * 「拆成单条」而不是「整簇丢弃」，是为了让行为单调可解释：簇内本来就不相关，
+ * 每条各占一个目录正是「内容不同就新建目录」的字面含义。此前对单条簇开豁免、
+ * 对两条簇做凝聚度解散，导致「1 条建目录、2 条反而不建」——数量多了结果反而更差。
  */
 export function groupOverflow(items: readonly OverflowItem[]): OverflowResult {
   if (items.length === 0) return { groups: [], unassignedIds: [] };
@@ -428,29 +479,19 @@ function clusterOverflow(items: readonly OverflowItem[], maxDirs: number): strin
     for (let c = 0; c < k; c++) {
       const ids = items.filter((_, i) => result.assignments[i] === c).map((i) => i.id);
       if (ids.length === 0) continue;
-      // 单条成簇不判凝聚度——它本来就该单独一个目录
-      if (ids.length >= 2) {
-        const cohesion = computeDirectoryCohesion(ids.map((id) => byId.get(id)!.vector));
-        if (cohesion < OVERFLOW_COHESION_MIN) continue;
+
+      // 单条簇没有凝聚度可言（computeDirectoryCohesion 对 <2 条返回 1.0），
+      // 统一走同一条判断，避免再出现「规模不同、规则不同」
+      const cohesion = computeDirectoryCohesion(ids.map((id) => byId.get(id)!.vector));
+      if (cohesion < OVERFLOW_COHESION_MIN) {
+        for (const id of ids) groups.push([id]);
+        continue;
       }
       groups.push(ids);
     }
   }
 
-  // 被解散的成员落到碎片池，按域名兜底成组
-  const grouped = new Set(groups.flat());
-  const fragments = items.filter((i) => !grouped.has(i.id));
-  if (fragments.length < MIN_FRAGMENT_FOR_DIR) return groups;
-
-  const byDomain = new Map<string, string[]>();
-  for (const item of fragments) {
-    byDomain.set(item.domain, [...(byDomain.get(item.domain) ?? []), item.id]);
-  }
-
-  return [
-    ...groups,
-    ...Array.from(byDomain.values()).filter((ids) => ids.length >= DOMAIN_FALLBACK_MIN),
-  ];
+  return groups;
 }
 
 /**
@@ -469,7 +510,7 @@ export function mergeDirectoryTree(
   }
 
   if (unassignedIds.length > 0) {
-    tree['未分类'] = [...(tree['未分类'] ?? []), ...unassignedIds];
+    tree[UNCLASSIFIED_DIR] = [...(tree[UNCLASSIFIED_DIR] ?? []), ...unassignedIds];
   }
 
   return tree;

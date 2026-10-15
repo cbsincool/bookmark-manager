@@ -33,6 +33,13 @@ export function DirectoryPreview({ proposal, onExecute, onCancel, onRefineDir }:
     <div className="space-y-4">
       <h3 className="text-sm font-semibold text-gray-700">{t('organize.previewStep')}</h3>
 
+      {(proposal.mergedFolderNames?.length ?? 0) > 1 && (
+        <p className="text-[11px] text-gray-500">
+          {t('organize.mergedFolders')}
+          {proposal.mergedFolderNames!.join(' + ')}
+        </p>
+      )}
+
       {stats && (
         <div className="space-y-2">
           <div className="grid grid-cols-4 gap-2 text-center">

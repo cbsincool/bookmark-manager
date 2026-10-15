@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1 } from '../dedupEngine';
+import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2Content } from '../dedupEngine';
+import { NEUTRAL_SCORE } from '@/shared/constants';
 import type { BookmarkNode } from '@/shared/types';
 
 const makeBookmark = (id: string, title: string, url: string): BookmarkNode => ({
@@ -59,5 +60,26 @@ describe('scoreL1', () => {
     const short = scoreL1('https://example.com/page');
     const long = scoreL1('https://example.com/' + 'a'.repeat(200));
     expect(short).toBeGreaterThan(long);
+  });
+});
+
+describe('scoreL2Content', () => {
+  it('stays neutral when no summary is cached', () => {
+    // 扫描时不发网络请求，没有缓存的条目必须既不奖也不罚，
+    // 否则等于凭空给整库书签加了一个偏移
+    expect(scoreL2Content(undefined)).toBe(NEUTRAL_SCORE);
+  });
+
+  it('scores a page that was fetched but yielded nothing very low', () => {
+    // 抓过却拿不到内容：登录墙 / 空壳页
+    expect(scoreL2Content('')).toBeLessThan(NEUTRAL_SCORE);
+    expect(scoreL2Content('   ')).toBeLessThan(NEUTRAL_SCORE);
+  });
+
+  it('ranks a substantial page above a thin one', () => {
+    const thin = scoreL2Content('很短的一句话');
+    const rich = scoreL2Content('正文内容。'.repeat(120));
+    expect(rich).toBeGreaterThan(thin);
+    expect(rich).toBeGreaterThan(NEUTRAL_SCORE);
   });
 });

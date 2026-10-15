@@ -1,6 +1,6 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import { DB_NAME, DB_VERSION, STORES } from './constants';
-import type { VectorEntry, BookmarkCache, DirectoryVector, BookmarkNode, ClassifiedBookmark, PageSummary } from './types';
+import type { VectorEntry, BookmarkCache, DirectoryVector, BookmarkNode, PageSummary } from './types';
 
 export class BookmarkDB {
   private dbPromise: Promise<IDBPDatabase>;
@@ -23,8 +23,10 @@ export class BookmarkDB {
         if (!db.objectStoreNames.contains(STORES.DELETED_BOOKMARKS)) {
           db.createObjectStore(STORES.DELETED_BOOKMARKS, { keyPath: 'id' });
         }
-        if (!db.objectStoreNames.contains(STORES.CLASSIFIED_BOOKMARKS)) {
-          db.createObjectStore(STORES.CLASSIFIED_BOOKMARKS, { keyPath: 'id' });
+        // 归类标记已废弃（整理改为「以现有目录为骨架」，不再需要记账）。
+        // 旧版本建的 store 在这里删掉，避免留下无人读写的死数据。
+        if (db.objectStoreNames.contains(STORES.CLASSIFIED_BOOKMARKS)) {
+          db.deleteObjectStore(STORES.CLASSIFIED_BOOKMARKS);
         }
         if (!db.objectStoreNames.contains(STORES.PAGE_SUMMARIES)) {
           db.createObjectStore(STORES.PAGE_SUMMARIES, { keyPath: 'id' });
@@ -116,34 +118,6 @@ export class BookmarkDB {
   async clearDeletedBookmarks(): Promise<void> {
     const db = await this.dbPromise;
     await db.clear(STORES.DELETED_BOOKMARKS);
-  }
-
-  // --- Classified Bookmarks ---
-
-  async putClassified(id: string, classifiedAt: number): Promise<void> {
-    const db = await this.dbPromise;
-    await db.put(STORES.CLASSIFIED_BOOKMARKS, { id, classifiedAt } satisfies ClassifiedBookmark);
-  }
-
-  async getClassified(id: string): Promise<ClassifiedBookmark | undefined> {
-    const db = await this.dbPromise;
-    return db.get(STORES.CLASSIFIED_BOOKMARKS, id);
-  }
-
-  async deleteClassified(id: string): Promise<void> {
-    const db = await this.dbPromise;
-    await db.delete(STORES.CLASSIFIED_BOOKMARKS, id);
-  }
-
-  async clearAllClassified(): Promise<void> {
-    const db = await this.dbPromise;
-    await db.clear(STORES.CLASSIFIED_BOOKMARKS);
-  }
-
-  async getAllClassifiedIds(): Promise<string[]> {
-    const db = await this.dbPromise;
-    const all = await db.getAll(STORES.CLASSIFIED_BOOKMARKS) as ClassifiedBookmark[];
-    return all.map((e) => e.id);
   }
 
   // --- Page Summaries ---

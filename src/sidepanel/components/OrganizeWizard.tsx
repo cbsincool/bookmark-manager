@@ -233,6 +233,7 @@ export function OrganizeWizard() {
           bookmarkIds: remainingIds,
           scope: 'global',
           categories: store.categories,
+          mode: store.organizeMode,
         });
 
         if (!startResp?.success) throw new Error(startResp?.error || '启动失败');
@@ -253,6 +254,7 @@ export function OrganizeWizard() {
         lowCohesionPaths: aiProposal?.lowCohesionPaths ?? [],
         skeletonPaths: aiProposal?.skeletonPaths,
         overflowPaths: aiProposal?.overflowPaths,
+        mergedFolderNames: aiProposal?.mergedFolderNames,
         stats: aiProposal?.stats,
       });
       store.setStep('preview');
@@ -279,6 +281,7 @@ export function OrganizeWizard() {
         bookmarkIds: [],
         scope: 'folder',
         folderId: store.organizeFolderId,
+        mode: store.organizeMode,
       });
 
       if (!startResp?.success) throw new Error(startResp?.error || '启动失败');
@@ -321,6 +324,7 @@ export function OrganizeWizard() {
           lowCohesionPaths: task.result.lowCohesionPaths ?? [],
           skeletonPaths: task.result.skeletonPaths,
           overflowPaths: task.result.overflowPaths,
+          mergedFolderNames: task.result.mergedFolderNames,
           stats: task.result.stats,
         };
       }
@@ -413,6 +417,28 @@ export function OrganizeWizard() {
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-gray-700">{t('organize.scope.title')}</h3>
           <p className="text-xs text-gray-500">{t('organize.scope.hint')}</p>
+
+          <div className="space-y-1">
+            <p className="text-xs font-medium text-gray-600">{t('organize.mode.title')}</p>
+            {(['fit', 'replan'] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => store.setOrganizeMode(mode)}
+                className={`w-full px-3 py-2 text-left rounded-lg border transition-colors ${
+                  store.organizeMode === mode
+                    ? 'border-indigo-400 bg-indigo-50'
+                    : 'border-gray-200 hover:border-gray-300'
+                }`}
+              >
+                <p className="text-sm text-gray-800">
+                  {t(mode === 'fit' ? 'organize.mode.fit' : 'organize.mode.replan')}
+                </p>
+                <p className="text-xs text-gray-500">
+                  {t(mode === 'fit' ? 'organize.mode.fitHint' : 'organize.mode.replanHint')}
+                </p>
+              </button>
+            ))}
+          </div>
 
           <div className="space-y-2">
             <button

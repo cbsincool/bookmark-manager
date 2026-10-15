@@ -513,7 +513,8 @@ def main() -> int:
 
                 record("AI 命名：确实走了模型（未降级成关键词）",
                        stats.get("warning") not in ("ai-unavailable", "ai-naming-failed"),
-                       f"warning={stats.get('warning')}")
+                       f"warning={stats.get('warning')} | "
+                       f"原因={str(stats.get('warningDetail'))[:200]}")
                 record("AI 命名：目录名不含空格", not spaced,
                        f"{len(paths)} 个目录: {', '.join(paths[:10])}"
                        + (f"，违规: {spaced[:5]}" if spaced else ""))
@@ -680,6 +681,107 @@ def main() -> int:
 
         panel.screenshot(path=str(Path(__file__).parent / "screenshots" / "verify-final.png"),
                          full_page=True)
+
+        # ---- 重复整理与同级同义目录合并 ----
+        print("\n" + "=" * 64)
+        print("⑪ 重复整理安全 + 同义目录合并")
+        print("=" * 64)
+
+        bar_id = panel.evaluate(
+            """async () => (await chrome.bookmarks.getTree())[0].children[0].id"""
+        )
+
+        # 同级同义目录：本该是一回事
+        merge_ids = panel.evaluate(
+            """async ([barId]) => {
+                const a = await chrome.bookmarks.create({ parentId: barId, title: '工作' });
+                const b = await chrome.bookmarks.create({ parentId: barId, title: '工作相关' });
+                const ids = [];
+                for (const [parentId, title, url] of [
+                    [a.id, '季度汇报模板', 'https://example.com/report'],
+                    [a.id, '项目排期表', 'https://example.com/schedule'],
+                    [b.id, '周会纪要规范', 'https://example.com/meeting'],
+                    [b.id, '需求评审流程', 'https://example.com/review'],
+                ]) {
+                    const bm = await chrome.bookmarks.create({ parentId, title, url });
+                    ids.push(bm.id);
+                }
+                return { a: a.id, b: b.id, ids };
+            }""",
+            [bar_id],
+        )
+
+        r = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                         "scope": "folder", "folderId": merge_ids["a"],
+                         "mode": "fit"}, 60_000)
+        merge_task = (r.get("data") or {}).get("taskId") if r.get("success") else None
+        merged_names: list[str] = []
+        merge_proposal = None
+
+        if not merge_task:
+            record("同义目录合并：启动", False, f"err={r.get('error', '')}")
+        else:
+            for _ in range(180):
+                panel.wait_for_timeout(2000)
+                poll = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_POLL",
+                                    "taskId": merge_task}, 60_000)
+                task = poll.get("data") or {}
+                if task.get("status") == "completed":
+                    merge_proposal = task.get("result") or {}
+                    merged_names = list(merge_proposal.get("mergedFolderNames") or [])
+                    break
+                if task.get("status") == "failed":
+                    record("同义目录合并：完成", False, str(task.get("error"))[:160])
+                    break
+
+        record("同义目录合并：「工作相关」被识别为同级同义目录",
+               sorted(merged_names) == ["工作", "工作相关"],
+               f"mergedFolderNames={merged_names}")
+        if merge_proposal:
+            merged_members = {i for ids in (merge_proposal.get("directoryTree") or {}).values() for i in ids}
+            record("同义目录合并：两个目录的书签一起参与整理",
+                   set(merge_ids["ids"]).issubset(merged_members),
+                   f"参与 {len(merged_members)} 条")
+
+        # 归档标记已取消：连续两次全局整理，第二次不该是空的
+        first_total = None
+        second_total = None
+
+        for label in ("第一次", "第二次"):
+            start = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_START",
+                                 "bookmarkIds": [], "scope": "global", "mode": "fit"}, 60_000)
+            tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
+            if not tid:
+                record(f"重复整理：{label}启动", False, f"err={start.get('error', '')}")
+                continue
+            for _ in range(240):
+                panel.wait_for_timeout(2000)
+                poll = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_POLL", "taskId": tid}, 60_000)
+                task = poll.get("data") or {}
+                if task.get("status") == "completed":
+                    total_now = (task.get("result") or {}).get("stats", {}).get("total")
+                    if label == "第一次":
+                        first_total = total_now
+                    else:
+                        second_total = total_now
+                    break
+                if task.get("status") == "failed":
+                    record(f"重复整理：{label}完成", False, str(task.get("error"))[:160])
+                    break
+
+        record("重复整理：第二次不再空转（归档标记已取消）",
+               bool(second_total) and second_total == first_total,
+               f"第一次 total={first_total}，第二次 total={second_total}")
+
+        # 清理这一段产物（书签由末尾统一删，这里删目录）
+        panel.evaluate(
+            """async ([ids]) => {
+                for (const id of ids) {
+                    try { await chrome.bookmarks.removeTree(id); } catch (e) {}
+                }
+            }""",
+            [[merge_ids["a"], merge_ids["b"]]],
+        )
 
         # ---- 还原 AI 设置（凭证不留在 profile 里）----
         if AI_KEY and prev_settings:

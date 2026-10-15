@@ -44,6 +44,7 @@ export function DedupCard({ group, onKeepChange, onConfirm, onSkip }: DedupCardP
                 <p className="text-xs text-gray-400 mt-1">📁 {item.bookmark.path}</p>
                 <div className="flex gap-3 mt-1 text-xs text-gray-400">
                   <span>L1: {item.scores.l1}</span>
+                  <span>L2: {item.scores.l2}</span>
                   <span>L3: {item.scores.l3}</span>
                   <span className="font-medium text-gray-600">
                     {t(isKeep ? 'dedup.keep' : 'dedup.delete')}: {Math.round(item.totalScore)}

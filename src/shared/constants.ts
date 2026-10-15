@@ -1,5 +1,5 @@
 export const DB_NAME = 'bookmark-manager';
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 export const STORES = {
   VECTORS: 'vectors',
@@ -7,8 +7,12 @@ export const STORES = {
   DIRECTORY_VECTORS: 'directoryVectors',
   SETTINGS: 'settings',
   DELETED_BOOKMARKS: 'deletedBookmarks',
-  CLASSIFIED_BOOKMARKS: 'classifiedBookmarks',
   PAGE_SUMMARIES: 'pageSummaries',
+  /**
+   * 已废弃：整理曾用「已归类标记」跳过重复整理，现改为「以现有目录为骨架」，
+   * 不再需要记账。常量保留只为在 DB 升级时把这个历史 store 删掉。
+   */
+  CLASSIFIED_BOOKMARKS: 'classifiedBookmarks',
 } as const;
 
 // 向量嵌入服务（tei-bge-m3）
@@ -54,16 +58,34 @@ export const ASSIGN_ACCEPT_THRESHOLD = 0.55;
 export const OVERFLOW_ACCEPT_RATIO = 0.6;
 /** 溢出二次聚类的凝聚度下限，低于此值的簇是硬凑，解散为碎片 */
 export const OVERFLOW_COHESION_MIN = 0.45;
-/** 碎片池不足此规模时不建目录，直接并入「未分类」 */
-export const MIN_FRAGMENT_FOR_DIR = 3;
-/** 碎片池按域名兜底成组时，同域名的最小出现次数 */
-export const DOMAIN_FALLBACK_MIN = 3;
+/**
+ * 去重三维权重：URL 表层 / 内容质量 / 元数据。三者各管一件事，不重叠，
+ * 所以接近均分；L1 略高是因为它对每一条都可用，而 L2 只在摘要已缓存时才生效。
+ */
+export const DEDUP_WEIGHTS = { l1: 0.4, l2: 0.3, l3: 0.3 } as const;
+
+/** 各维评分的中性值：既不加分也不减分 */
+export const NEUTRAL_SCORE = 50;
+/** 页面摘要短于此长度视为内容稀薄 */
+export const SHORT_SUMMARY_LENGTH = 80;
+/** 长于此长度视为有实质正文 */
+export const RICH_SUMMARY_LENGTH = 400;
+
+/** 兜底目录名：既归不进任何目录、也不值得单独建目录的书签放这里 */
+export const UNCLASSIFIED_DIR = '未分类';
+
 /** 溢出阶段新建目录的硬上限 */
 export const MAX_NEW_DIRS_CAP = 8;
 
-/** 溢出新建目录的数量上限：溢出条目越多允许建越多，但有硬顶 */
+/**
+ * 溢出新建目录的数量上限。
+ *
+ * 只做硬顶，不再按 sqrt 缩放：溢出条目本来就已经过了一轮聚类，
+ * 相似的自然合在一起，剩下的都是确实互不相关的。再按比例压缩只会让
+ * 「1 条能建目录、2 条反而不行」这类非单调行为重新出现。
+ */
 export function maxNewDirectories(overflowCount: number): number {
-  return Math.min(MAX_NEW_DIRS_CAP, Math.max(1, Math.ceil(overflowCount / 5)));
+  return Math.min(MAX_NEW_DIRS_CAP, Math.max(1, overflowCount));
 }
 
 export const DEFAULT_SETTINGS: import('./types').AppSettings = {
