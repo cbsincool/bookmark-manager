@@ -2,3 +2,31 @@ node_modules/
 dist/
 .superpowers/
 *.log
+.gstack/
+
+# 测试用 Chrome profile：内含扩展 IndexedDB，可能残留 API 凭证，绝不能提交
+chrome-*/
+
+__pycache__/
+test/screenshots/
+
+# 早期排查留在仓库根目录的一次性脚本与产物，不属于项目
+/auto-log.txt
+/auto-test*.py
+/auto-test*.txt
+/capture-console.py
+/console-log.txt
+/debug-*.py
+/debug-log.txt
+/dist.rar
+/ext-page.png
+/full-auto-test.py
+/init-test-profile.py
+/kzt.txt
+/monitor-console.py
+/test-ext.py
+/test-extension*.py
+/test-with-agent-browser.bat
+
+# 端到端报告是每次运行重新生成的产物
+/test/verify-report.json

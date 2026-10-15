@@ -1,6 +1,6 @@
 import type { BookmarkNode, DedupGroup, DedupItem, QualityScores } from '@/shared/types';
 import { normalizeUrl, type NormalizeOptions } from '@/shared/urlUtils';
-import { WELL_KNOWN_DOMAINS } from '@/shared/constants';
+import { WELL_KNOWN_DOMAINS, LOW_INFO_TITLES } from '@/shared/constants';
 
 export function findExactUrlDuplicates(
   bookmarks: readonly BookmarkNode[],
@@ -81,29 +81,107 @@ export function scoreL1(url: string): number {
   return Math.max(0, Math.min(100, score));
 }
 
-export async function scoreL2(url: string): Promise<number> {
-  let score = 50;
+/**
+ * L2: Structure density score - evaluates URL structure quality without network requests.
+ * Focuses on content indicators from URL structure:
+ * - Path depth and semantic meaningfulness
+ * - Document/article indicators vs generic pages
+ * - Content-rich URL patterns
+ */
+export function scoreL2(url: string): number {
+  let score = 50; // base
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
+    const parsed = new URL(url);
+    const pathname = parsed.pathname;
+    const hostname = parsed.hostname;
 
-    const response = await fetch(url, {
-      method: 'HEAD',
-      signal: controller.signal,
-      redirect: 'follow',
-    });
-    clearTimeout(timeout);
-
-    if (response.ok) {
-      score += 25;
-      const contentLength = parseInt(response.headers.get('content-length') ?? '0', 10);
-      if (contentLength > 5000) score += 10;
-    } else if (response.status >= 400) {
-      score -= 30;
+    // Path depth - deeper paths often indicate specific content
+    const pathSegments = pathname.split('/').filter((s) => s.length > 0);
+    if (pathSegments.length >= 2 && pathSegments.length <= 4) {
+      score += 10; // Good depth for content pages
+    } else if (pathSegments.length > 4) {
+      score -= 5; // Too deep, might be nested navigation
     }
+
+    // Document/content indicators in path
+    const docPatterns = [
+      /\/docs?\//i, /\/guide/i, /\/tutorial/i, /\/learn\//i,
+      /\/api\//i, /\/reference\//i, /\/manual\//i,
+      /\/blog\//i, /\/article\//i, /\/post\//i,
+      /\/wiki\//i, /\/book\//i, /\/course\//i,
+    ];
+    if (docPatterns.some((p) => p.test(pathname))) {
+      score += 15;
+    }
+
+    // Generic/homepage indicators - lower score
+    const genericPatterns = [
+      /^\/$/, /^\/(index|home|main|default)\.?(html|php|asp)?$/i,
+      /^\/(category|tag|archive|search)$/i,
+    ];
+    if (genericPatterns.some((p) => p.test(pathname))) {
+      score -= 20;
+    }
+
+    // File extension - specific formats often indicate documents
+    if (/\.(pdf|md|txt|html|htm)$/i.test(pathname)) {
+      score += 10;
+    }
+
+    // Query string with meaningful content indicators
+    const searchParams = parsed.searchParams;
+    const hasContentParam = searchParams.has('id') || searchParams.has('page') ||
+                           searchParams.has('article') || searchParams.has('post');
+    if (hasContentParam && pathSegments.length === 0) {
+      score += 5; // Content via query params is OK but not ideal
+    }
+
+    // Subdomain indicating specific content area
+    const subdomain = hostname.split('.')[0];
+    const contentSubdomains = ['docs', 'doc', 'guide', 'learn', 'api', 'dev', 'blog', 'help', 'support', 'wiki'];
+    if (contentSubdomains.includes(subdomain.toLowerCase())) {
+      score += 10;
+    }
+
   } catch {
-    score -= 20; // timeout or network error
+    // Invalid URL
+    score -= 10;
+  }
+
+  return Math.max(0, Math.min(100, score));
+}
+
+/** Run scoreL2 for multiple URLs (synchronous since no network requests). */
+export function scoreL2Batch(urls: string[]): number[] {
+  return urls.map((url) => scoreL2(url));
+}
+
+/**
+ * L3: Bookmark metadata quality score (local, no network/API needed).
+ * - Title informativeness: penalizes meaningless titles
+ * - Recency: newer bookmarks score higher
+ */
+export function scoreL3(bookmark: BookmarkNode): number {
+  let score = 50;
+
+  // Title informativeness
+  const titleLower = bookmark.title.trim().toLowerCase();
+  const isLowInfo = (LOW_INFO_TITLES as readonly string[]).some(
+    (t) => titleLower === t || titleLower.startsWith(t + ' ') || titleLower.endsWith(' ' + t),
+  );
+  if (isLowInfo) score -= 30;
+  if (!bookmark.title.trim()) score -= 40;
+
+  // Recency: full score if bookmarked within last 90 days, decays to 0 over 2 years
+  if (bookmark.dateAdded) {
+    const ageMs = Date.now() - bookmark.dateAdded;
+    const ageDays = ageMs / (1000 * 60 * 60 * 24);
+    if (ageDays <= 90) {
+      score += 20;
+    } else if (ageDays <= 730) {
+      score += Math.round(20 * (1 - (ageDays - 90) / 640));
+    }
   }
 
   return Math.max(0, Math.min(100, score));
@@ -114,18 +192,17 @@ export function buildDedupGroups(
   sameTitleGroups: { title: string; items: BookmarkNode[] }[],
   scores: Map<string, QualityScores>,
   l1Weight: number,
-  l2Weight: number,
   l3Weight: number,
 ): DedupGroup[] {
   const groups: DedupGroup[] = [];
 
   for (const group of exactUrlGroups) {
     const items: DedupItem[] = group.items.map((bm) => {
-      const s = scores.get(bm.id) ?? { l1: 50, l2: 50, l3: 50 };
+      const s = scores.get(bm.id) ?? { l1: 50, l3: 50 };
       return {
         bookmark: bm,
         scores: s,
-        totalScore: s.l1 * l1Weight + s.l2 * l2Weight + s.l3 * l3Weight,
+        totalScore: s.l1 * l1Weight + s.l3 * l3Weight,
       };
     });
     items.sort((a, b) => b.totalScore - a.totalScore);
@@ -139,11 +216,11 @@ export function buildDedupGroups(
 
   for (const group of sameTitleGroups) {
     const items: DedupItem[] = group.items.map((bm) => {
-      const s = scores.get(bm.id) ?? { l1: 50, l2: 50, l3: 50 };
+      const s = scores.get(bm.id) ?? { l1: 50, l3: 50 };
       return {
         bookmark: bm,
         scores: s,
-        totalScore: s.l1 * l1Weight + s.l2 * l2Weight + s.l3 * l3Weight,
+        totalScore: s.l1 * l1Weight + s.l3 * l3Weight,
       };
     });
     items.sort((a, b) => b.totalScore - a.totalScore);

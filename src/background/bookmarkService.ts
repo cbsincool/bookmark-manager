@@ -73,3 +73,59 @@ export async function findOrCreateFolderPath(
 
   return currentParentId;
 }
+
+/**
+ * Get all existing directory paths (folders only, not bookmarks)
+ */
+export async function getAllDirectoryPaths(): Promise<string[]> {
+  const tree = await chrome.bookmarks.getTree();
+  const paths: string[] = [];
+
+  function walk(nodes: chrome.bookmarks.BookmarkTreeNode[], parentPath = ''): void {
+    for (const node of nodes) {
+      if (!node.url && node.children) {
+        // It's a folder
+        const currentPath = parentPath ? `${parentPath}/${node.title}` : node.title;
+        paths.push(currentPath);
+        walk(node.children, currentPath);
+      }
+    }
+  }
+
+  walk(tree);
+  return paths;
+}
+
+/** 书签栏的 id —— `getTree()` 根节点的第一个子节点。目录路径的基准是它 */
+export async function getRootFolderId(): Promise<string> {
+  const tree = await chrome.bookmarks.getTree();
+  return tree[0]?.children?.[0]?.id ?? '1';
+}
+
+/**
+ * 列出 rootId 之下的所有目录路径，**相对于 rootId**。
+ *
+ * 与 `getAllDirectoryPaths()` 的差别很关键：后者从书签树根开始走，产出的路径带
+ * 「书签栏」前缀（`书签栏/技术文档`），而 `findOrCreateFolderPath(parts, rootId)`
+ * 建出来的路径不带前缀（`技术文档`）。拿前者去比对后者，永远匹配不上——
+ * 「只使用已有目录」会因此把骨架整个过滤掉，最终一条书签都归不了位。
+ */
+export async function getDirectoryPathsUnder(rootId: string): Promise<string[]> {
+  const nodes = await chrome.bookmarks
+    .getSubTree(rootId)
+    .catch(() => [] as chrome.bookmarks.BookmarkTreeNode[]);
+
+  const paths: string[] = [];
+
+  function walk(children: chrome.bookmarks.BookmarkTreeNode[] | undefined, parentPath: string): void {
+    for (const child of children ?? []) {
+      if (child.url || !child.children) continue;
+      const currentPath = parentPath ? `${parentPath}/${child.title}` : child.title;
+      paths.push(currentPath);
+      walk(child.children, currentPath);
+    }
+  }
+
+  walk(nodes[0]?.children, '');
+  return paths;
+}

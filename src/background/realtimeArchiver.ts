@@ -1,8 +1,8 @@
 import { BookmarkDB } from '@/shared/db';
-import { sendToOffscreen } from './offscreenManager';
+import { generateEmbedding } from './embeddingClient';
 import { cosineSimilarity } from '@/shared/vectorSearch';
 import { callCloudAPI, buildClassificationPrompt, parseClassificationResponse } from './apiClient';
-import { moveBookmark, findOrCreateFolderPath } from './bookmarkService';
+import { moveBookmark, findOrCreateFolderPath, getAllDirectoryPaths } from './bookmarkService';
 import type { AppSettings } from '@/shared/types';
 
 const db = new BookmarkDB();
@@ -16,11 +16,11 @@ export async function handleNewBookmark(
 
   const text = `${bookmark.title} ${bookmark.url}`;
 
-  // Generate embedding
-  const resp = await sendToOffscreen({ type: 'GENERATE_EMBEDDING', text }) as { success: boolean; data: number[] };
-  if (!resp.success) return;
-
-  const vector = new Float32Array(resp.data);
+  // Generate embedding via tei-bge-m3 (1024-dim).
+  // Must use the same model as handleRebuildIndex / handleSearch, otherwise the
+  // vector written here lives in a different space and cosine similarity against
+  // the rest of the index is meaningless (and dimension mismatch yields NaN).
+  const vector = await generateEmbedding(text);
 
   // Save to index
   await db.putVector({ id: bookmark.id, vector, text, updatedAt: Date.now() });
@@ -48,9 +48,15 @@ export async function handleNewBookmark(
   } else if (settings.apiEndpoint && settings.apiKey) {
     // Ask cloud API for classification
     try {
+      const existingPaths = settings.onlyUseExistingDirectories ? await getAllDirectoryPaths() : undefined;
       const prompt = buildClassificationPrompt(
         [{ id: bookmark.id, title: bookmark.title, url: bookmark.url, path: '' }],
-        dirVectors.map((d) => d.name),
+        settings.topLevelCategories,
+        {
+          onlyExisting: settings.onlyUseExistingDirectories,
+          existingPaths,
+          depthMode: 'deep',
+        },
       );
       const response = await callCloudAPI(prompt, settings);
       const classification = parseClassificationResponse(response);
@@ -60,15 +66,39 @@ export async function handleNewBookmark(
         const pathParts = firstPath.split('/');
         const tree = await chrome.bookmarks.getTree();
         const rootId = tree[0]?.children?.[0]?.id ?? '1';
-        const folderId = await findOrCreateFolderPath(pathParts, rootId);
-        await moveBookmark(bookmark.id, folderId);
 
-        chrome.notifications.create({
-          type: 'basic',
-          iconUrl: 'icons/icon48.png',
-          title: 'Bookmark Archived',
-          message: `"${bookmark.title}" → ${firstPath}`,
-        });
+        if (settings.onlyUseExistingDirectories) {
+          // Only move if the path already exists
+          const allPaths = await getAllDirectoryPaths();
+          if (allPaths.includes(firstPath)) {
+            const folderId = await findOrCreateFolderPath(pathParts, rootId);
+            await moveBookmark(bookmark.id, folderId);
+            chrome.notifications.create({
+              type: 'basic',
+              iconUrl: 'icons/icon48.png',
+              title: 'Bookmark Archived',
+              message: `"${bookmark.title}" → ${firstPath}`,
+            });
+          } else {
+            // Notify user that manual classification is needed
+            chrome.notifications.create({
+              type: 'basic',
+              iconUrl: 'icons/icon48.png',
+              title: 'Bookmark Needs Classification',
+              message: `"${bookmark.title}" does not fit existing directories. Please classify manually.`,
+            });
+          }
+        } else {
+          // Create folders as needed
+          const folderId = await findOrCreateFolderPath(pathParts, rootId);
+          await moveBookmark(bookmark.id, folderId);
+          chrome.notifications.create({
+            type: 'basic',
+            iconUrl: 'icons/icon48.png',
+            title: 'Bookmark Archived',
+            message: `"${bookmark.title}" → ${firstPath}`,
+          });
+        }
       }
     } catch (err) {
       console.error('[BM] Real-time archiving API call failed:', err);

@@ -1,4 +1,15 @@
+/**
+ * Cosine similarity between two vectors.
+ *
+ * Returns 0 for mismatched dimensions instead of computing a partial product:
+ * vectors produced by different embedding models (e.g. a stale 384-dim
+ * all-MiniLM-L6-v2 entry alongside 1024-dim bge-m3 entries) are not comparable,
+ * and reading past the shorter vector's end would yield NaN and corrupt the
+ * whole ranking.
+ */
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 0;
+
   let dot = 0;
   let normA = 0;
   let normB = 0;

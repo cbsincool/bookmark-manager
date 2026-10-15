@@ -1,23 +1,51 @@
-import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath } from './bookmarkService';
-import { sendToOffscreen } from './offscreenManager';
-import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2, buildDedupGroups } from './dedupEngine';
-import { buildDomainClusters } from './organizeEngine';
-import { callCloudAPI, buildClassificationPrompt, parseClassificationResponse, buildQualityPrompt, parseQualityResponse, testConnection } from './apiClient';
+import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder } from './bookmarkService';
+import { generateEmbedding, generateEmbeddingsBatch } from './embeddingClient';
+import { rerank } from './rerankerClient';
+import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL3, buildDedupGroups } from './dedupEngine';
+import { buildDomainClusters, computeDirectoryCohesion, computeDirectoryVector, buildSemanticClusters, computeOptimalK, assignToSkeleton, groupOverflow, mergeDirectoryTree } from './organizeEngine';
+import type { SkeletonNode, OverflowItem, SemanticCluster, OverflowGroup } from './organizeEngine';
+import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse, buildClusterNamingPrompt, parseClusterNamingResponse } from './apiClient';
 import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
-import { DEFAULT_SETTINGS, BATCH_SIZE } from '@/shared/constants';
-import type { AppSettings, QualityScores } from '@/shared/types';
-import type { MessageRequest, MessageResponse } from '@/shared/messageTypes';
+import { cosineSimilarity } from '@/shared/vectorSearch';
+import { extractDomain } from '@/shared/urlUtils';
+import { suggestDirectoryName } from '@/shared/directoryNaming';
+import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, ASSIGN_ACCEPT_THRESHOLD, MIN_SKELETON_CLUSTER_SIZE } from '@/shared/constants';
+import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats } from '@/shared/types';
+import type { MessageRequest, MessageResponse, AsyncTask } from '@/shared/messageTypes';
 
 const db = new BookmarkDB();
+
+// Async task storage
+const asyncTasks = new Map<string, AsyncTask>();
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
 // --- Settings helpers ---
 
 async function getSettings(): Promise<AppSettings> {
-  const stored = await db.getSetting('appSettings');
-  return { ...DEFAULT_SETTINGS, ...(stored as Partial<AppSettings> | undefined) };
+  const stored = await db.getSetting('appSettings') as Partial<AppSettings> | undefined;
+  const merged = { ...DEFAULT_SETTINGS, ...stored };
+
+  // A persisted config still pointing at a retired gateway would leave every AI
+  // feature failing with no obvious cause — fall back to the current default.
+  const endpoint = (stored?.apiEndpoint ?? '').replace(/\/+$/, '');
+  if (endpoint && DEPRECATED_API_ENDPOINTS.includes(endpoint)) {
+    return {
+      ...merged,
+      apiEndpoint: DEFAULT_SETTINGS.apiEndpoint,
+      apiModel: DEFAULT_SETTINGS.apiModel,
+      apiFormat: DEFAULT_SETTINGS.apiFormat,
+    };
+  }
+
+  // 模型同样会下架：网关对已下架模型直接回 400，而 {...DEFAULT, ...stored}
+  // 里 stored 优先，光改默认值对老用户不生效。只迁移 endpoint 盖不住这种情况。
+  if (stored?.apiModel && DEPRECATED_API_MODELS.includes(stored.apiModel)) {
+    return { ...merged, apiModel: DEFAULT_SETTINGS.apiModel };
+  }
+
+  return merged;
 }
 
 async function updateSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
@@ -47,10 +75,13 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
       return getAllBookmarks();
 
     case 'GENERATE_EMBEDDING':
-      return sendToOffscreen({ type: 'GENERATE_EMBEDDING', text: msg.text });
+      // Float32Array does not survive chrome.runtime.sendMessage's JSON
+      // serialization — it arrives as {0:..,1:..} with no length. Return a
+      // plain number[] to match the documented contract.
+      return Array.from(await generateEmbedding(msg.text));
 
     case 'GENERATE_EMBEDDINGS_BATCH':
-      return sendToOffscreen({ type: 'GENERATE_EMBEDDINGS_BATCH', texts: msg.texts });
+      return (await generateEmbeddingsBatch(msg.texts)).map((v) => Array.from(v));
 
     case 'SEARCH':
       return handleSearch(msg.query);
@@ -61,14 +92,35 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
     case 'DEDUP_EXECUTE':
       return handleDedupExecute(msg.keepIds, msg.deleteIds);
 
+    case 'DEDUP_MANUAL_FORCE':
+      return handleDedupManualForce(msg.bookmarkIds);
+
+    case 'DEDUP_UNDO':
+      return handleDedupUndo(msg.deletedIds);
+
     case 'ORGANIZE_DOMAIN_CLUSTER':
       return handleDomainCluster();
 
-    case 'ORGANIZE_AI_CLASSIFY':
-      return handleAIClassify(msg.bookmarks);
+    case 'ORGANIZE_SEMANTIC_CLUSTER':
+      return handleSemanticCluster(msg.bookmarkIds);
+
+    case 'ORGANIZE_CONNECTIVITY_CHECK':
+      return handleConnectivityCheck(msg.bookmarkIds);
+
+    case 'ORGANIZE_AI_CLASSIFY_START':
+      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories);
+
+    case 'ORGANIZE_AI_CLASSIFY_POLL':
+      return handleAIClassifyPoll(msg.taskId);
 
     case 'ORGANIZE_EXECUTE':
-      return handleOrganizeExecute(msg.moves);
+      return handleOrganizeExecute(msg.directoryTree, msg.rootId);
+
+    case 'ORGANIZE_RECLASSIFY':
+      return handleReclassify(msg.sourceFolders, msg.targetCategory);
+
+    case 'GET_FOLDER_STRUCTURE':
+      return handleGetFolderStructure();
 
     case 'GET_SETTINGS':
       return getSettings();
@@ -76,11 +128,29 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
     case 'UPDATE_SETTINGS':
       return updateSettings(msg.settings);
 
+    case 'TEST_AI_CONNECTION':
+      return handleTestAIConnection();
+
     case 'GET_INDEX_STATS':
       return handleGetIndexStats();
 
     case 'REBUILD_INDEX':
       return handleRebuildIndex();
+
+    case 'FETCH_PAGE_SUMMARY':
+      return handleFetchPageSummary(msg.bookmarkId, msg.url);
+
+    case 'FINE_DEDUP_ANALYZE':
+      return handleFineDedupAnalyze(msg.bookmarkIds);
+
+    case 'GET_CLASSIFIED_IDS':
+      return db.getAllClassifiedIds();
+
+    case 'DELETE_CLASSIFIED_MARK':
+      return db.deleteClassified(msg.bookmarkId);
+
+    case 'CLEAR_ALL_CLASSIFIED_MARKS':
+      return db.clearAllClassified();
 
     default:
       throw new Error(`Unknown message type: ${(msg as { type: string }).type}`);
@@ -92,29 +162,59 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
 async function handleSearch(query: string): Promise<unknown> {
   const settings = await getSettings();
   const allBookmarks = await getAllBookmarks();
+
+  // Filter out bookmarks in [待删除_失效] folder
+  const filteredBookmarks = allBookmarks.filter((bm) => !bm.path.includes('[待删除_失效]'));
+
   const allVectors = await db.getAllVectors();
 
   // Generate query embedding
-  const embeddingResp = await sendToOffscreen({ type: 'GENERATE_EMBEDDING', text: query }) as { success: boolean; data: number[] };
-  const queryVector = new Float32Array(embeddingResp.data);
+  const queryVector = await generateEmbedding(query);
 
   // Semantic search
-  const semanticResults = allVectors.map((v) => {
-    let dot = 0, normA = 0, normB = 0;
-    for (let i = 0; i < queryVector.length; i++) {
-      dot += queryVector[i] * v.vector[i];
-      normA += queryVector[i] * queryVector[i];
-      normB += v.vector[i] * v.vector[i];
+  const semanticResults = allVectors.map((v) => ({
+    id: v.id,
+    semanticScore: cosineSimilarity(queryVector, v.vector),
+  }));
+
+  // Take top-K semantic candidates (exclude near-zero similarity items)
+  const TOP_K = 50;
+  const SEMANTIC_MIN_SCORE = 0.3; // Raised from 0.2 — 0.2 was too lenient, letting in thematically adjacent but irrelevant results
+  const topCandidates = [...semanticResults]
+    .sort((a, b) => b.semanticScore - a.semanticScore)
+    .slice(0, TOP_K)
+    .filter((r) => r.semanticScore >= SEMANTIC_MIN_SCORE);
+
+  // Rerank top-N candidates using bge-reranker
+  const RERANK_K = 20;
+  const rerankScores = new Map<string, number>();
+  const rerankCandidates = topCandidates.slice(0, RERANK_K);
+
+  if (rerankCandidates.length > 0) {
+    const bmMap = new Map(filteredBookmarks.map((b) => [b.id, b]));
+    const candidateTexts = rerankCandidates.map((c) => {
+      const bm = bmMap.get(c.id);
+      return bm ? `${bm.title} ${bm.url}` : '';
+    });
+
+    try {
+      const scores = await rerank(query, candidateTexts);
+      rerankCandidates.forEach((c, i) => rerankScores.set(c.id, scores[i]));
+    } catch {
+      // Reranker unavailable - fall back to semantic scores
     }
-    const sim = Math.sqrt(normA) * Math.sqrt(normB) === 0
-      ? 0
-      : dot / (Math.sqrt(normA) * Math.sqrt(normB));
-    return { id: v.id, semanticScore: sim };
-  });
+  }
+
+  // Only expose semantic scores for top candidates (not all vectors)
+  const rerankResults = topCandidates.map((r) => ({
+    id: r.id,
+    semanticScore: r.semanticScore,
+    rerankScore: rerankScores.get(r.id) ?? 0,
+  }));
 
   return {
-    bookmarks: allBookmarks,
-    semanticScores: semanticResults,
+    bookmarks: filteredBookmarks,
+    semanticScores: rerankResults,
     settings: {
       fuzzyWeight: settings.searchFuzzyWeight,
       semanticWeight: settings.searchSemanticWeight,
@@ -125,9 +225,19 @@ async function handleSearch(query: string): Promise<unknown> {
 
 // --- Dedup ---
 
+function broadcastProgress(type: string, current: number, total: number, message: string) {
+  chrome.runtime.sendMessage({ type, current, total, message }).catch(() => {});
+}
+
 async function handleDedupScan(): Promise<unknown> {
   const settings = await getSettings();
   const bookmarks = await getAllBookmarks();
+
+  // Filter out bookmarks in [待删除_失效] folder
+  const filteredBookmarks = bookmarks.filter((bm) => !bm.path.includes('[待删除_失效]'));
+  const total = filteredBookmarks.length;
+
+  broadcastProgress('DEDUP_SCAN_PROGRESS', 0, total, `扫描中 (0/${total})`);
 
   const normOpts = {
     stripUtm: settings.urlNormStripUtm,
@@ -135,29 +245,45 @@ async function handleDedupScan(): Promise<unknown> {
     stripHash: settings.urlNormStripHash,
   };
 
-  const exactUrlGroups = findExactUrlDuplicates(bookmarks, normOpts);
-  const sameTitleGroups = findSameTitleDuplicates(bookmarks);
+  const exactUrlGroups = findExactUrlDuplicates(filteredBookmarks, normOpts);
+  broadcastProgress('DEDUP_SCAN_PROGRESS', Math.floor(total * 0.4), total, `URL 去重完成，正在分析标题...`);
+
+  const sameTitleGroups = findSameTitleDuplicates(filteredBookmarks);
+  broadcastProgress('DEDUP_SCAN_PROGRESS', Math.floor(total * 0.7), total, `正在计算质量评分...`);
 
   // Score all items involved in dedup
   const allDedupIds = new Set<string>();
   for (const g of exactUrlGroups) g.items.forEach((i) => allDedupIds.add(i.id));
   for (const g of sameTitleGroups) g.items.forEach((i) => allDedupIds.add(i.id));
 
-  const scores = new Map<string, QualityScores>();
-  const dedupBookmarks = bookmarks.filter((b) => allDedupIds.has(b.id));
+  const dedupBookmarks = filteredBookmarks.filter((b) => allDedupIds.has(b.id));
 
-  for (const bm of dedupBookmarks) {
-    const l1 = scoreL1(bm.url);
-    const l2 = await scoreL2(bm.url);
-    scores.set(bm.id, { l1, l2, l3: 50 }); // L3 default 50 until cloud scoring
+  // L1 scoring
+  const l1Map = new Map<string, number>();
+  for (let i = 0; i < dedupBookmarks.length; i++) {
+    l1Map.set(dedupBookmarks[i].id, scoreL1(dedupBookmarks[i].url));
   }
 
-  const l3Enabled = settings.l3Enabled && settings.apiEndpoint && settings.apiKey;
-  const l1Weight = l3Enabled ? 0.3 : 0.5;
-  const l2Weight = l3Enabled ? 0.3 : 0.5;
-  const l3Weight = l3Enabled ? 0.4 : 0;
+  // L3 元数据评分（本地计算，无需 API）
+  const l3Map = new Map<string, number>();
+  for (const bm of dedupBookmarks) {
+    l3Map.set(bm.id, scoreL3(bm));
+  }
 
-  const groups = buildDedupGroups(exactUrlGroups, sameTitleGroups, scores, l1Weight, l2Weight, l3Weight);
+  const scores = new Map<string, QualityScores>();
+  for (const bm of dedupBookmarks) {
+    scores.set(bm.id, {
+      l1: l1Map.get(bm.id) ?? 50,
+      l3: l3Map.get(bm.id) ?? 50,
+    });
+  }
+
+  const l1Weight = 0.5;
+  const l3Weight = 0.5;
+
+  const groups = buildDedupGroups(exactUrlGroups, sameTitleGroups, scores, l1Weight, l3Weight);
+
+  broadcastProgress('DEDUP_SCAN_PROGRESS', total, total, `扫描完成，发现 ${groups.length} 组重复`);
 
   return groups;
 }
@@ -166,48 +292,921 @@ async function handleDedupExecute(
   keepIds: readonly string[],
   deleteIds: readonly string[],
 ): Promise<unknown> {
+  const allBookmarks = await getAllBookmarks();
+
+  // Save deleted bookmarks for undo before deleting
   for (const id of deleteIds) {
+    const bm = allBookmarks.find((b) => b.id === id);
+    if (bm) {
+      // Get current position info from Chrome API
+      try {
+        const [node] = await chrome.bookmarks.get(id);
+        if (node) {
+          await db.saveDeletedBookmark({
+            ...bm,
+            parentId: node.parentId ?? '',
+            index: node.index ?? 0,
+          });
+        }
+      } catch {
+        // Bookmark might already be gone, skip saving
+      }
+    }
     await removeBookmark(id);
     await db.deleteVector(id);
   }
   return { deleted: deleteIds.length };
 }
 
+async function handleDedupUndo(
+  deletedIds: readonly string[],
+): Promise<unknown> {
+  let restored = 0;
+
+  for (const id of deletedIds) {
+    const saved = await db.getDeletedBookmark(id);
+    if (!saved) continue;
+
+    try {
+      // Recreate the bookmark at its original position
+      await chrome.bookmarks.create({
+        parentId: saved.parentId,
+        title: saved.title,
+        url: saved.url,
+        index: saved.index,
+      });
+      restored++;
+    } catch (err) {
+      console.warn(`[BM] Failed to restore bookmark ${id}:`, err);
+    }
+  }
+
+  // Clear saved bookmarks after undo
+  await db.clearDeletedBookmarks();
+  return { restored };
+}
+
+async function handleDedupManualForce(
+  bookmarkIds: readonly string[],
+): Promise<unknown> {
+  const bookmarks = await getAllBookmarks();
+  const selected = bookmarks.filter((b) => bookmarkIds.includes(b.id));
+
+  const items: import('@/shared/types').DedupItem[] = selected.map((bm) => {
+    const l1 = scoreL1(bm.url);
+    const l3 = scoreL3(bm);
+    return {
+      bookmark: bm,
+      scores: { l1, l3 },
+      totalScore: l1 * 0.5 + l3 * 0.5,
+    };
+  });
+
+  items.sort((a, b) => b.totalScore - a.totalScore);
+  const group: import('@/shared/types').DedupGroup = {
+    id: `manual-${Date.now()}`,
+    scenario: 'manual',
+    items,
+    recommendedKeepId: items[0].bookmark.id,
+  };
+  return group;
+}
+
+// --- Fine Dedup ---
+
+async function handleFetchPageSummary(bookmarkId: string, url: string): Promise<unknown> {
+  const cached = await db.getPageSummary(bookmarkId);
+  if (cached) return cached;
+
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 10000);
+    const resp = await fetch(url, { signal: ctrl.signal });
+    const html = await resp.text();
+
+    // Extract title
+    const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+    const pageTitle = titleMatch ? titleMatch[1].trim() : '';
+
+    // Extract meta description
+    const metaMatch = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i)
+      ?? html.match(/<meta[^>]+content=["']([^"']*)["'][^>]+name=["']description["']/i);
+    const metaDesc = metaMatch ? metaMatch[1].trim() : '';
+
+    // Extract body text (first 200 chars)
+    const bodyText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+
+    const summary = [pageTitle, metaDesc, bodyText].filter(Boolean).join(' — ').slice(0, 400);
+    const result = { id: bookmarkId, summary, fetchedAt: Date.now() };
+    await db.putPageSummary(bookmarkId, summary);
+    return result;
+  } catch {
+    const fallback = { id: bookmarkId, summary: '', fetchedAt: Date.now() };
+    return fallback;
+  }
+}
+
+async function handleFineDedupAnalyze(bookmarkIds: readonly string[]): Promise<unknown> {
+  const settings = await getSettings();
+  const bookmarks = await getAllBookmarks();
+  const selected = bookmarks.filter((b) => bookmarkIds.includes(b.id));
+  const total = selected.length;
+
+  // Fetch summaries for all selected bookmarks
+  const summaries: { id: string; title: string; url: string; summary: string }[] = [];
+  for (let i = 0; i < selected.length; i++) {
+    const bm = selected[i];
+    broadcastProgress('FINE_DEDUP_PROGRESS', i, total, `抓取摘要中 (${i + 1}/${total})`);
+    const cached = await db.getPageSummary(bm.id);
+    let summary = cached?.summary ?? '';
+    if (!summary && bm.url) {
+      const result = await handleFetchPageSummary(bm.id, bm.url) as { summary: string };
+      summary = result.summary ?? '';
+    }
+    summaries.push({ id: bm.id, title: bm.title, url: bm.url, summary });
+  }
+
+  broadcastProgress('FINE_DEDUP_PROGRESS', total, total, `摘要抓取完成，正在 AI 分析...`);
+
+  if (!settings.apiEndpoint || !settings.apiKey) {
+    // No AI: return summaries only, let user decide
+    return { summaries, aiResult: null };
+  }
+
+  const prompt = buildFineDedupPrompt(summaries);
+  const response = await callCloudAPI(prompt, settings);
+  const aiResult = parseFineDedupResponse(response);
+
+  return { summaries, aiResult };
+}
+
 // --- Organize ---
 
 async function handleDomainCluster(): Promise<unknown> {
-  const settings = await getSettings();
   const bookmarks = await getAllBookmarks();
-  return buildDomainClusters(bookmarks, settings.domainClusterMinCount);
+  // Filter out bookmarks in [待删除_失效] folder
+  const filteredBookmarks = bookmarks.filter((bm) => !bm.path.includes('[待删除_失效]'));
+  // Return ALL domains (minCount=1) so user can choose which to use as directories
+  return buildDomainClusters(filteredBookmarks, 1);
 }
 
-async function handleAIClassify(
-  bookmarks: readonly { id: string; title: string; url: string; path: string; summary?: string }[],
+async function handleSemanticCluster(
+  bookmarkIds: readonly string[],
+): Promise<{ topicName: string; bookmarkIds: string[] }[]> {
+  // Get vectors for the specified bookmarks
+  const allVectors = await db.getAllVectors();
+  const vectors = allVectors
+    .filter((v) => bookmarkIds.includes(v.id))
+    .map((v) => ({ id: v.id, vector: v.vector }));
+
+  if (vectors.length < 6) {
+    // Not enough data for clustering
+    return [];
+  }
+
+  const bookmarks = await getAllBookmarks();
+  const relevantBookmarks = bookmarks.filter((b) => bookmarkIds.includes(b.id));
+
+  // Determine number of clusters (max 5, min 2)
+  const k = Math.min(5, Math.max(2, Math.floor(vectors.length / 10)));
+
+  // 只回传可序列化的字段：centroid 是 Float32Array，过 chrome.runtime.sendMessage
+  // 会被 JSON 序列化成 {0:..,1:..} 并丢掉 length
+  return buildSemanticClusters(vectors, relevantBookmarks, k).map((cluster) => ({
+    topicName: cluster.topicName,
+    bookmarkIds: cluster.bookmarkIds,
+  }));
+}
+
+async function handleConnectivityCheck(
+  bookmarkIds: readonly string[],
+): Promise<{ deadIds: string[]; checkedCount: number }> {
+  // Filter out bookmarks already in [待删除_失效] folder
+  const allBookmarks = await getAllBookmarks();
+  const filteredIds = bookmarkIds.filter((id) => {
+    const bm = allBookmarks.find((b) => b.id === id);
+    return bm && !bm.path.includes('[待删除_失效]');
+  });
+
+  const CONCURRENCY = 5; // Reduce concurrency to avoid rate limiting
+  const TIMEOUT_MS = 15000; // Increase timeout to 15 seconds
+  const deadIds: string[] = [];
+  let idx = 0;
+
+  /**
+   * Check if a URL is truly dead (404/410).
+   * Returns true only for confirmed dead links, not for network errors.
+   */
+  async function checkUrl(url: string): Promise<{ isDead: boolean; reason: string }> {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+
+    try {
+      // Try GET request with Range header to minimize data transfer
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: { 'Range': 'bytes=0-1' }, // Only request 1 byte
+        signal: ctrl.signal,
+        redirect: 'follow',
+        cache: 'no-cache',
+      });
+      clearTimeout(timer);
+
+      // Only 404 and 410 are confirmed dead
+      if (resp.status === 404) {
+        return { isDead: true, reason: '404 Not Found' };
+      }
+      if (resp.status === 410) {
+        return { isDead: true, reason: '410 Gone' };
+      }
+      // 200, 206 (Partial Content), 301, 302, etc. are all valid
+      return { isDead: false, reason: `HTTP ${resp.status}` };
+    } catch (err) {
+      clearTimeout(timer);
+
+      // Don't treat network errors as dead - could be temporary issues
+      const errorName = err instanceof Error ? err.name : String(err);
+
+      // AbortError = timeout, give it a second chance
+      if (errorName === 'AbortError') {
+        console.log(`[Connectivity] Timeout for ${url}, skipping (not marking as dead)`);
+        return { isDead: false, reason: 'timeout' };
+      }
+
+      // Other network errors - don't mark as dead
+      console.log(`[Connectivity] Network error for ${url}: ${errorName}, skipping`);
+      return { isDead: false, reason: `network error: ${errorName}` };
+    }
+  }
+
+  async function worker() {
+    while (idx < filteredIds.length) {
+      const id = filteredIds[idx++];
+      const nodes = await chrome.bookmarks.get(id).catch(() => [] as chrome.bookmarks.BookmarkTreeNode[]);
+      const node = nodes[0];
+      if (!node?.url) continue;
+
+      // Skip non-HTTP URLs
+      if (!node.url.startsWith('http://') && !node.url.startsWith('https://')) {
+        continue;
+      }
+
+      const result = await checkUrl(node.url);
+      if (result.isDead) {
+        console.log(`[Connectivity] Dead link: ${node.url} (${result.reason})`);
+        deadIds.push(id);
+      }
+
+      const done = filteredIds.length - filteredIds.slice(idx).length;
+      broadcastProgress('CONNECTIVITY_CHECK_PROGRESS', done, filteredIds.length,
+        `检测中 (${done}/${filteredIds.length})`);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(CONCURRENCY, filteredIds.length) },
+    worker,
+  );
+  await Promise.all(workers);
+
+  if (deadIds.length > 0) {
+    const tree = await chrome.bookmarks.getTree();
+    const rootId = tree[0]?.children?.[0]?.id ?? '1';
+    const folderId = await findOrCreateFolderPath(['[待删除_失效]'], rootId);
+    for (const id of deadIds) {
+      await moveBookmark(id, folderId).catch(() => {});
+    }
+  }
+
+  return { deadIds, checkedCount: filteredIds.length };
+}
+
+// --- Async AI Classification ---
+
+function generateTaskId(): string {
+  return `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function handleAIClassifyStart(
+  bookmarkIds: readonly string[],
+  scope: 'global' | 'folder',
+  folderId?: string,
+  categories?: readonly string[],
+): Promise<{ taskId: string }> {
+  const taskId = generateTaskId();
+
+  asyncTasks.set(taskId, {
+    id: taskId,
+    status: 'pending',
+    progress: { current: 0, total: 1, message: '正在准备...' },
+  });
+
+  const settings = await getSettings();
+  const allBookmarks = await getAllBookmarks();
+
+  let filtered: BookmarkNode[];
+  if (scope === 'folder' && folderId) {
+    // Folder scope: find all bookmarks whose parent chain includes this folder
+    const targetFolder = await chrome.bookmarks.get(folderId).catch(() => [] as chrome.bookmarks.BookmarkTreeNode[]);
+    const folderTitle = targetFolder[0]?.title ?? '';
+    filtered = allBookmarks.filter((b) => b.path.includes(folderTitle) && !b.path.includes('[待删除_失效]'));
+  } else {
+    filtered = allBookmarks.filter((b) => !b.path.includes('[待删除_失效]'));
+  }
+
+  // Global scope: skip already-classified bookmarks
+  let bookmarks: BookmarkNode[];
+  if (scope === 'global') {
+    const classifiedIds = await db.getAllClassifiedIds();
+    const classifiedSet = new Set(classifiedIds);
+    bookmarks = filtered.filter((b) => !classifiedSet.has(b.id));
+  } else {
+    // Folder scope: all bookmarks in folder participate regardless of classified status
+    bookmarks = filtered;
+  }
+
+  processAIClassify(taskId, bookmarks, settings, scope, categories).catch((err) => {
+    console.error('[Organize] Task failed:', taskId, err);
+    const task = asyncTasks.get(taskId);
+    if (task) {
+      task.status = 'failed';
+      task.error = String(err);
+    }
+  });
+
+  return { taskId };
+}
+
+async function handleAIClassifyPoll(taskId: string): Promise<AsyncTask> {
+  const task = asyncTasks.get(taskId);
+  if (!task) {
+    throw new Error(`Task not found: ${taskId}`);
+  }
+
+  // Clean up completed tasks after returning
+  if (task.status === 'completed' || task.status === 'failed') {
+    // Keep task for a short time for polling, then clean up
+    setTimeout(() => asyncTasks.delete(taskId), 5000);
+  }
+
+  return task;
+}
+
+/**
+ * 整理流程：全量定骨架 → 逐条归位 → 溢出成组 → 汇合。
+ *
+ * 骨架由全量语义聚类产出（保证目录层次与全局主题结构一致），
+ * 但每条书签的最终归属由它自己的向量与各目录中心的余弦决定——
+ * 与所有目录都不像的书签才会触发新建目录。
+ */
+
+/** 成员向量的均值，作为目录中心 */
+function averageVectors(vectors: readonly Float32Array[]): Float32Array {
+  const dim = vectors[0]?.length ?? 0;
+  const avg = new Float32Array(dim);
+  let used = 0;
+
+  for (const v of vectors) {
+    if (v.length !== dim) continue; // 维度不一致的陈旧向量直接跳过
+    for (let d = 0; d < dim; d++) avg[d] += v[d];
+    used++;
+  }
+
+  if (used > 0) {
+    for (let d = 0; d < dim; d++) avg[d] /= used;
+  }
+  return avg;
+}
+
+/**
+ * 把聚类结果落成目录骨架。同名的簇合并成一个目录并重算中心——
+ * AI 很容易给两个不同的簇起同一个名字。
+ */
+function buildSkeleton(
+  clusters: readonly SemanticCluster[],
+  naming: Readonly<Record<string, string>>,
+  vectorMap: ReadonlyMap<string, Float32Array>,
+): SkeletonNode[] {
+  const byPath = new Map<string, string[]>();
+
+  clusters.forEach((cluster, i) => {
+    const path = naming[String(i)] || cluster.topicName || `分类${i + 1}`;
+    byPath.set(path, [...(byPath.get(path) ?? []), ...cluster.bookmarkIds]);
+  });
+
+  return Array.from(byPath.entries()).map(([path, memberIds]) => {
+    const vectors = memberIds
+      .map((id) => vectorMap.get(id))
+      .filter((v): v is Float32Array => v !== undefined);
+
+    return { path, memberIds, centroid: averageVectors(vectors), isOverflow: false };
+  });
+}
+
+interface NamingOutcome {
+  readonly paths: Record<string, string>;
+  /** 模型是否真的产出了可用命名（false = 静默退回了关键词命名） */
+  readonly usedAi: boolean;
+}
+
+/** 让 AI 给每个簇命名；AI 不可用或调用失败时退回关键词命名 */
+async function nameClusters(
+  clusters: readonly SemanticCluster[],
+  titleById: ReadonlyMap<string, string>,
+  settings: AppSettings,
+  canUseAI: boolean,
+  userCategories: readonly string[] | undefined,
+  maxDepth: number,
+): Promise<NamingOutcome> {
+  const fallback: Record<string, string> = {};
+  clusters.forEach((cluster, i) => {
+    fallback[String(i)] = cluster.topicName || `分类${i + 1}`;
+  });
+
+  if (!canUseAI) return { paths: fallback, usedAi: false };
+
+  try {
+    const clusterInput = clusters.map((cluster, i) => ({
+      clusterId: String(i),
+      titles: cluster.bookmarkIds
+        .slice(0, 12)
+        .map((id) => titleById.get(id) ?? '')
+        .filter(Boolean),
+    }));
+    const raw = await callCloudAPI(
+      buildClusterNamingPrompt(clusterInput, maxDepth, userCategories),
+      settings,
+    );
+    const parsed = parseClusterNamingResponse(raw);
+
+    // 模型可能只回了一部分簇，也可能回了一堆解析不出来的东西。
+    // 一个都没解析出来就算失败——否则用户会以为名字是模型起的。
+    const covered = clusters.filter((_, i) => parsed[String(i)]).length;
+    return { paths: { ...fallback, ...parsed }, usedAi: covered > 0 };
+  } catch (err) {
+    console.warn('[Organize] AI 命名失败，退回关键词命名:', err);
+    return { paths: fallback, usedAi: false };
+  }
+}
+
+/** 给溢出新建的目录命名。它们是平级目录，所以深度固定为 1 */
+async function nameOverflowGroups(
+  groups: readonly OverflowGroup[],
+  settings: AppSettings,
+  canUseAI: boolean,
+): Promise<string[]> {
+  const fallback = groups.map((group) => suggestDirectoryName(group.titles));
+  if (!canUseAI || groups.length === 0) return fallback;
+
+  try {
+    const clusterInput = groups.map((group, i) => ({
+      clusterId: String(i),
+      titles: group.titles.slice(0, 12),
+    }));
+    const raw = await callCloudAPI(buildClusterNamingPrompt(clusterInput, 1), settings);
+    const parsed = parseClusterNamingResponse(raw);
+    return groups.map((_, i) => parsed[String(i)] || fallback[i]);
+  } catch (err) {
+    console.warn('[Organize] 溢出目录命名失败，退回关键词命名:', err);
+    return fallback;
+  }
+}
+
+async function processAIClassify(
+  taskId: string,
+  bookmarks: readonly BookmarkNode[],
+  settings: AppSettings,
+  scope: 'global' | 'folder',
+  userCategories?: readonly string[],
+): Promise<void> {
+  const task = asyncTasks.get(taskId);
+  if (!task) return;
+
+  const updateProgress = (current: number, total: number, message: string) => {
+    task.progress = { current, total, message };
+  };
+
+  const finish = (
+    directoryTree: Record<string, string[]>,
+    skeletonPaths: readonly string[],
+    overflowPaths: readonly string[],
+    stats: OrganizeStats,
+  ) => {
+    task.status = 'completed';
+    task.result = { directoryTree, lowCohesionPaths: [], skeletonPaths, overflowPaths, stats };
+  };
+
+  const statsFor = (overrides: Partial<OrganizeStats>): OrganizeStats => ({
+    total: bookmarks.length,
+    skeletonCount: 0,
+    assigned: 0,
+    overflow: 0,
+    overflowDirectories: 0,
+    unassigned: bookmarks.length,
+    acceptThreshold: ASSIGN_ACCEPT_THRESHOLD,
+    ...overrides,
+  });
+
+  try {
+    task.status = 'running';
+    const total = bookmarks.length;
+
+    if (total === 0) {
+      finish({}, [], [], statsFor({}));
+      return;
+    }
+
+    // --- 阶段 0：补齐向量 ---
+    updateProgress(0, total, `获取向量中 (0/${total})`);
+    const allVectors = await db.getAllVectors();
+    const vectorMap = new Map(allVectors.map((v) => [v.id, v.vector]));
+
+    const missing = bookmarks.filter((b) => !vectorMap.has(b.id));
+    if (missing.length > 0) {
+      for (let i = 0; i < missing.length; i += BATCH_SIZE) {
+        const batch = missing.slice(i, i + BATCH_SIZE);
+        const texts = batch.map((b) => `${b.title} ${b.url}`);
+        const vectors = await generateEmbeddingsBatch(texts);
+        for (let j = 0; j < batch.length; j++) {
+          vectorMap.set(batch[j].id, vectors[j]);
+          await db.putVector({ id: batch[j].id, vector: vectors[j], text: texts[j], updatedAt: Date.now() });
+        }
+        updateProgress(i + batch.length, missing.length, `生成向量中 (${i + batch.length}/${missing.length})`);
+      }
+    }
+
+    const vectors = bookmarks
+      .map((b) => ({ id: b.id, vector: vectorMap.get(b.id) }))
+      .filter((v): v is { id: string; vector: Float32Array } => v.vector !== undefined);
+
+    const titleById = new Map(bookmarks.map((b) => [b.id, b.title]));
+
+    // 书签太少，聚类没有意义
+    if (vectors.length < 4) {
+      finish({ '未分类': bookmarks.map((b) => b.id) }, [], [], statsFor({}));
+      return;
+    }
+
+    const canUseAI = Boolean(
+      settings.apiEndpoint && (settings.apiFormat === 'anthropic' || settings.apiKey),
+    );
+
+    // --- 阶段 1：全量定骨架 ---
+    const k = computeOptimalK(vectors.length);
+    updateProgress(0, total, `语义聚类中 (k=${k})`);
+    const clusters = buildSemanticClusters(vectors, [...bookmarks], k, {
+      minClusterSize: MIN_SKELETON_CLUSTER_SIZE,
+    });
+
+    if (clusters.length === 0) {
+      finish({ '未分类': bookmarks.map((b) => b.id) }, [], [], statsFor({}));
+      return;
+    }
+
+    updateProgress(0, clusters.length, `AI 命名中 (0/${clusters.length})`);
+    const naming = await nameClusters(
+      clusters,
+      titleById,
+      settings,
+      canUseAI,
+      userCategories,
+      settings.organizeMaxDepth ?? 3,
+    );
+    updateProgress(clusters.length, clusters.length, 'AI 命名完成');
+
+    let skeleton = buildSkeleton(clusters, naming.paths, vectorMap);
+
+    // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
+    // 必须用相对书签栏的路径比对——findOrCreateFolderPath 的基准是书签栏，
+    // getAllDirectoryPaths 产出的是带「书签栏」前缀的路径，两者对不上。
+    if (settings.onlyUseExistingDirectories) {
+      const existing = new Set(await getDirectoryPathsUnder(await getRootFolderId()));
+      skeleton = skeleton.filter((node) => existing.has(node.path));
+    }
+
+    // --- 阶段 2：逐条归位 ---
+    updateProgress(0, total, `归位中 (0/${total})`);
+    const assignment = assignToSkeleton(vectors, skeleton, ASSIGN_ACCEPT_THRESHOLD);
+    updateProgress(total, total, '归位完成');
+
+    // --- 阶段 3：溢出成组 ---
+    let overflowEntries: { path: string; ids: string[] }[] = [];
+    let unassignedIds = [...assignment.overflowIds];
+
+    if (assignment.overflowIds.length > 0 && !settings.onlyUseExistingDirectories) {
+      updateProgress(0, assignment.overflowIds.length, `处理 ${assignment.overflowIds.length} 条未归位书签`);
+
+      const overflowItems: OverflowItem[] = assignment.overflowIds
+        .map((id) => {
+          const vector = vectorMap.get(id);
+          const bookmark = bookmarks.find((b) => b.id === id);
+          if (!vector || !bookmark) return null;
+          return { id, vector, title: bookmark.title, domain: extractDomain(bookmark.url) };
+        })
+        .filter((item): item is OverflowItem => item !== null);
+
+      const overflow = groupOverflow(overflowItems);
+      const names = await nameOverflowGroups(overflow.groups, settings, canUseAI);
+
+      overflowEntries = overflow.groups.map((group, i) => ({
+        path: names[i],
+        ids: [...group.ids],
+      }));
+      unassignedIds = [...overflow.unassignedIds];
+    }
+
+    // --- 阶段 4：汇合 ---
+    const assignedIds = new Set(assignment.assigned.flatMap((b) => b.ids));
+    const accounted = new Set([...assignedIds, ...unassignedIds]);
+    // 没有向量、因而没参与归位的书签，一并落进未分类——保证 Σ成员 + 未分类 === 总数
+    unassignedIds = [...unassignedIds, ...bookmarks.filter((b) => !accounted.has(b.id)).map((b) => b.id)];
+
+    const directoryTree = mergeDirectoryTree(
+      [...assignment.assigned.map((b) => ({ path: b.path, ids: [...b.ids] })), ...overflowEntries],
+      unassignedIds,
+    );
+
+    const stats = statsFor({
+      skeletonCount: skeleton.length,
+      assigned: assignedIds.size,
+      overflow: assignment.overflowIds.length,
+      overflowDirectories: overflowEntries.length,
+      unassigned: unassignedIds.length,
+      warning: assignment.warning
+        ?? (canUseAI ? (naming.usedAi ? undefined : 'ai-naming-failed') : 'ai-unavailable'),
+    });
+
+    // 已归类标记覆盖全部参与整理的书签（含溢出与未分类）
+    const now = Date.now();
+    for (const bm of bookmarks) {
+      await db.putClassified(bm.id, now).catch(() => {});
+    }
+
+    finish(
+      directoryTree,
+      skeleton.map((node) => node.path),
+      overflowEntries.map((entry) => entry.path),
+      stats,
+    );
+  } catch (err) {
+    task.status = 'failed';
+    task.error = String(err);
+    throw err;
+  }
+}
+
+async function handleOrganizeExecute(
+  directoryTree: Record<string, readonly string[]>,
+  rootId: string,
+): Promise<unknown> {
+  let moved = 0;
+  let skipped = 0;
+  const allVectors = await db.getAllVectors();
+  const vectorMap = new Map(allVectors.map((v) => [v.id, v.vector]));
+
+  // 防御性校验：即便上游没拦住，执行阶段也不新建目录。
+  // 预览与执行之间用户可能改了设置，这里以执行时的设置为准。
+  const settings = await getSettings();
+  const existingPaths = settings.onlyUseExistingDirectories
+    ? new Set(await getDirectoryPathsUnder(await getRootFolderId()))
+    : null;
+
+  // 记录每个书签原本在哪个目录，整理结束后只清理这些被搬空的目录
+  const parentOf = await buildParentMap();
+  const emptied = new Set<string>();
+
+  for (const [path, bookmarkIds] of Object.entries(directoryTree)) {
+    if (existingPaths && !existingPaths.has(path)) {
+      skipped += bookmarkIds.length;
+      continue;
+    }
+
+    // Create folder path
+    const pathParts = path.split('/');
+    const folderId = await findOrCreateFolderPath(pathParts, rootId);
+
+    // Move bookmarks to this folder
+    for (const bookmarkId of bookmarkIds) {
+      try {
+        const sourceId = parentOf.get(bookmarkId);
+        await moveBookmark(bookmarkId, folderId);
+        if (sourceId && sourceId !== folderId) emptied.add(sourceId);
+        moved++;
+        // Mark as classified after successful move
+        await db.putClassified(bookmarkId, Date.now()).catch(() => {});
+      } catch (err) {
+        console.warn(`[BM] Failed to move bookmark ${bookmarkId}:`, err);
+      }
+    }
+
+    // Compute and save directory vector for realtime archiving
+    const vectors: Float32Array[] = [];
+    for (const id of bookmarkIds) {
+      const vec = vectorMap.get(id);
+      if (vec) vectors.push(vec);
+    }
+
+    if (vectors.length > 0) {
+      const dirVector = computeDirectoryVector(vectors);
+      await db.putDirectoryVector({
+        id: folderId,
+        vector: dirVector,
+        name: path,
+        childCount: bookmarkIds.length,
+      });
+    }
+  }
+
+  // 清理本次搬空的目录（不动用户自己留的空文件夹）
+  const pruned = await pruneEmptiedFolders(emptied);
+
+  return { moved, skipped, pruned };
+}
+
+/**
+ * 只删除**本次整理搬空的**目录。
+ *
+ * 原实现从书签栏递归删除任何空目录——包括用户自己留的空文件夹。跑一次整理
+ * （哪怕一条书签都没移动）就会把「稍后阅读」这类占位目录删掉；在
+ * `onlyUseExistingDirectories=true` 下尤其矛盾，那个开关的语义正是保持用户既有结构。
+ *
+ * 现在只考虑「被搬走过书签的父目录」，且删除时再次确认它确实空了。
+ * 删掉一个目录可能让它的父目录也变空——但只有那个父目录**同样在搬空集合里**
+ * 才会被继续删除，用户自己的空目录一律不动。
+ */
+async function pruneEmptiedFolders(emptied: ReadonlySet<string>): Promise<number> {
+  let pruned = 0;
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    for (const id of emptied) {
+      const node = await chrome.bookmarks.get(id).catch(() => []);
+      if (node.length === 0) continue; // 已被删除
+
+      const children = await chrome.bookmarks.getChildren(id).catch(() => [null]);
+      if (children.length > 0) continue;
+
+      await chrome.bookmarks.remove(id).catch(() => {});
+      pruned++;
+      changed = true;
+    }
+  }
+
+  return pruned;
+}
+
+/** id → 父目录 id 的全量映射，用于判断书签是从哪个目录搬走的 */
+async function buildParentMap(): Promise<Map<string, string>> {
+  const tree = await chrome.bookmarks.getTree();
+  const parentOf = new Map<string, string>();
+
+  const walk = (nodes: chrome.bookmarks.BookmarkTreeNode[]): void => {
+    for (const node of nodes) {
+      if (node.parentId) parentOf.set(node.id, node.parentId);
+      if (node.children) walk(node.children);
+    }
+  };
+
+  walk(tree);
+  return parentOf;
+}
+
+// --- Folder Structure & Reclassify ---
+
+async function handleGetFolderStructure(): Promise<unknown> {
+  const tree = await chrome.bookmarks.getTree();
+  const root = tree[0]?.children?.[0];
+  if (!root) return [];
+
+  interface FolderInfo {
+    id: string;
+    title: string;
+    path: string;
+    count: number;
+  }
+
+  function collectFolders(node: chrome.bookmarks.BookmarkTreeNode, parentPath: string): FolderInfo[] {
+    const results: FolderInfo[] = [];
+    if (!node.children) return results;
+
+    for (const child of node.children) {
+      if (!child.url) { // It's a folder
+        const currentPath = parentPath ? `${parentPath}/${child.title}` : child.title;
+        const bookmarkCount = child.children?.filter((c) => c.url).length ?? 0;
+        results.push({
+          id: child.id,
+          title: child.title,
+          path: currentPath,
+          count: bookmarkCount,
+        });
+        results.push(...collectFolders(child, currentPath));
+      }
+    }
+    return results;
+  }
+
+  return collectFolders(root, '');
+}
+
+async function handleReclassify(
+  sourceFolders: readonly string[],
+  targetCategory: string,
 ): Promise<unknown> {
   const settings = await getSettings();
   if (!settings.apiEndpoint || !settings.apiKey) {
     throw new Error('API not configured');
   }
 
-  // Get existing top-level directories
-  const tree = await chrome.bookmarks.getTree();
-  const existingDirs = tree[0]?.children
-    ?.flatMap((c) => c.children ?? [])
-    .filter((c) => !c.url)
-    .map((c) => c.title) ?? [];
+  const allBookmarks = await getAllBookmarks();
 
-  const prompt = buildClassificationPrompt(bookmarks, existingDirs);
+  // Get bookmarks from source folders
+  const bookmarksToReclassify = allBookmarks.filter((b) => {
+    const topFolder = b.path.split('/')[0];
+    return sourceFolders.includes(topFolder);
+  });
+
+  if (bookmarksToReclassify.length === 0) {
+    return { moved: 0, message: 'No bookmarks to reclassify' };
+  }
+
+  // Build prompt with constraint to use target category as top-level
+  const prompt = buildClassificationPrompt(bookmarksToReclassify, [targetCategory], {
+    depthMode: 'deep',
+  });
   const response = await callCloudAPI(prompt, settings);
-  return parseClassificationResponse(response);
+  const directoryTree = parseClassificationResponse(response);
+
+  // Execute moves
+  const tree = await chrome.bookmarks.getTree();
+  const rootId = tree[0]?.children?.[0]?.id ?? '1';
+  let moved = 0;
+
+  for (const [path, bookmarkIds] of Object.entries(directoryTree)) {
+    const pathParts = path.split('/');
+    const folderId = await findOrCreateFolderPath(pathParts, rootId);
+
+    for (const bookmarkId of bookmarkIds) {
+      try {
+        await moveBookmark(bookmarkId, folderId);
+        moved++;
+      } catch (err) {
+        console.warn(`[BM] Failed to move bookmark ${bookmarkId}:`, err);
+      }
+    }
+  }
+
+  return { moved, total: bookmarksToReclassify.length };
 }
 
-async function handleOrganizeExecute(
-  moves: readonly { bookmarkId: string; targetFolderId: string }[],
-): Promise<unknown> {
-  for (const move of moves) {
-    await moveBookmark(move.bookmarkId, move.targetFolderId);
+// --- AI Connection Test ---
+
+async function handleTestAIConnection(): Promise<{ ok: boolean; message: string }> {
+  const settings = await getSettings();
+  if (!settings.apiEndpoint) {
+    return { ok: false, message: '请先填写 API 端点' };
   }
-  return { moved: moves.length };
+  if (!settings.apiModel) {
+    return { ok: false, message: '请先填写模型名称' };
+  }
+  const format = settings.apiFormat ?? 'openai';
+  const isAnthropic = format === 'anthropic';
+  const chatUrl = isAnthropic
+    ? resolveMessagesEndpoint(settings.apiEndpoint)
+    : resolveChatEndpoint(settings.apiEndpoint);
+
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (settings.apiKey) {
+    if (isAnthropic) {
+      headers['x-api-key'] = settings.apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+    } else {
+      headers['Authorization'] = `Bearer ${settings.apiKey}`;
+    }
+  } else if (!isAnthropic) {
+    headers['Authorization'] = 'Bearer no-key';
+  }
+
+  const body = isAnthropic
+    ? JSON.stringify({ model: settings.apiModel, max_tokens: 5, messages: [{ role: 'user', content: 'Say OK' }] })
+    : JSON.stringify({ model: settings.apiModel, messages: [{ role: 'user', content: 'Say OK' }], max_tokens: 5 });
+
+  try {
+    const response = await fetch(chatUrl, { method: 'POST', headers, body });
+    if (response.ok) {
+      const data = await response.json().catch(() => null);
+      const reply = isAnthropic
+        ? (data?.content?.[0]?.text ?? '')
+        : (data?.choices?.[0]?.message?.content ?? '');
+      return { ok: true, message: `连接成功 (${chatUrl})${reply ? '\n模型回复: ' + reply.trim() : ''}` };
+    }
+    const bodyText = await response.text().catch(() => '');
+    const detail = bodyText ? bodyText.slice(0, 150) : response.statusText;
+    return { ok: false, message: `HTTP ${response.status} — ${chatUrl}\n${detail}` };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `无法连接到 ${chatUrl}\n${msg}` };
+  }
 }
 
 // --- Index ---
@@ -221,25 +1220,33 @@ async function handleGetIndexStats(): Promise<unknown> {
 async function handleRebuildIndex(): Promise<unknown> {
   const bookmarks = await getAllBookmarks();
   await db.clear('vectors');
+  const total = bookmarks.length;
 
-  for (let i = 0; i < bookmarks.length; i += BATCH_SIZE) {
+  for (let i = 0; i < total; i += BATCH_SIZE) {
     const batch = bookmarks.slice(i, i + BATCH_SIZE);
     const texts = batch.map((b) => `${b.title} ${b.url} ${b.path}`);
-    const resp = await sendToOffscreen({ type: 'GENERATE_EMBEDDINGS_BATCH', texts }) as { success: boolean; data: number[][] };
+    const vectors = await generateEmbeddingsBatch(texts);
 
-    if (resp.success) {
-      for (let j = 0; j < batch.length; j++) {
-        await db.putVector({
-          id: batch[j].id,
-          vector: new Float32Array(resp.data[j]),
-          text: texts[j],
-          updatedAt: Date.now(),
-        });
-      }
+    for (let j = 0; j < batch.length; j++) {
+      await db.putVector({
+        id: batch[j].id,
+        vector: vectors[j],
+        text: texts[j],
+        updatedAt: Date.now(),
+      });
     }
+
+    // Broadcast progress
+    const indexed = Math.min(i + BATCH_SIZE, total);
+    chrome.runtime.sendMessage({
+      type: 'REBUILD_INDEX_PROGRESS',
+      current: indexed,
+      total,
+      message: `索引构建中 (${indexed}/${total})`,
+    }).catch(() => {});
   }
 
-  return { indexed: bookmarks.length };
+  return { indexed: total };
 }
 
 // --- Real-time archiving listener ---
@@ -259,20 +1266,19 @@ chrome.bookmarks.onChanged.addListener(async (id, changeInfo) => {
   if (!changeInfo.url && !changeInfo.title) return;
 
   try {
-    const [node] = await chrome.bookmarks.get(id);
-    if (!node.url) return;
+    // Get bookmark with path from getAllBookmarks to ensure consistency
+    const allBookmarks = await getAllBookmarks();
+    const bm = allBookmarks.find((b) => b.id === id);
+    if (!bm) return;
 
-    const text = `${node.title} ${node.url}`;
-    const resp = await sendToOffscreen({ type: 'GENERATE_EMBEDDING', text }) as { success: boolean; data: number[] };
-
-    if (resp.success) {
-      await db.putVector({
-        id,
-        vector: new Float32Array(resp.data),
-        text,
-        updatedAt: Date.now(),
-      });
-    }
+    const text = `${bm.title} ${bm.url} ${bm.path}`;
+    const vector = await generateEmbedding(text);
+    await db.putVector({
+      id,
+      vector,
+      text,
+      updatedAt: Date.now(),
+    });
   } catch (err) {
     console.error('[BM] Index update failed:', err);
   }
@@ -280,6 +1286,16 @@ chrome.bookmarks.onChanged.addListener(async (id, changeInfo) => {
 
 chrome.bookmarks.onRemoved.addListener(async (id) => {
   await db.deleteVector(id);
+  await db.deletePageSummary(id).catch(() => {});
+  await db.deleteClassified(id).catch(() => {});
+});
+
+chrome.bookmarks.onMoved.addListener(async (id) => {
+  try {
+    await db.putClassified(id, Date.now());
+  } catch (err) {
+    console.error('[BM] Failed to mark classified on move:', err);
+  }
 });
 
 // --- Install handler ---

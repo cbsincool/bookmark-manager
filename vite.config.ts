@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
@@ -16,11 +17,9 @@ export default defineConfig({
       '@': path.resolve(__dirname, 'src'),
     },
   },
-  build: {
-    rollupOptions: {
-      input: {
-        offscreen: 'src/offscreen/offscreen.html',
-      },
-    },
+  test: {
+    // test/specs 下是 WebdriverIO 的 e2e spec（依赖 browser/$ 全局），
+    // 由 wdio.conf.js 驱动，不属于 vitest 的单元测试范围。
+    exclude: ['**/node_modules/**', '**/dist/**', 'test/specs/**'],
   },
 });
