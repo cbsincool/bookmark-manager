@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import type { OrganizeProposal } from '@/shared/types';
 import { t } from '../i18n';
 
@@ -7,6 +7,7 @@ interface DirectoryPreviewProps {
   readonly onExecute: () => void;
   readonly onCancel: () => void;
   readonly onRefineDir: (path: string) => void;
+  readonly onRenameDir: (from: string, to: string) => void;
 }
 
 interface StatProps {
@@ -24,14 +25,66 @@ function Stat({ label, value }: StatProps) {
   );
 }
 
-export function DirectoryPreview({ proposal, onExecute, onCancel, onRefineDir }: DirectoryPreviewProps) {
+interface EditableNameProps {
+  readonly path: string;
+  readonly onCommit: (nextLeaf: string) => void;
+}
+
+/**
+ * 可编辑的目录名。用本地 state 缓冲输入，失焦或回车才提交——
+ * 每敲一个字就改 store 会让整棵树重排，光标都会跳。
+ */
+function EditableName({ path, onCommit }: EditableNameProps) {
+  const leaf = path.split('/').pop() ?? path;
+  const [draft, setDraft] = useState(leaf);
+
+  // 外部改名（例如合并了同义目录）后同步回来
+  useEffect(() => setDraft(leaf), [leaf]);
+
+  const commit = () => {
+    const next = draft.trim();
+    if (!next || next === leaf) {
+      setDraft(leaf);
+      return;
+    }
+    onCommit(next);
+  };
+
+  return (
+    <input
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+        if (e.key === 'Escape') { setDraft(leaf); (e.target as HTMLInputElement).blur(); }
+      }}
+      spellCheck={false}
+      className="min-w-0 flex-1 px-1 py-0.5 text-sm border border-transparent rounded hover:border-gray-200 focus:border-indigo-400 focus:outline-none bg-transparent"
+    />
+  );
+}
+
+export function DirectoryPreview({
+  proposal,
+  onExecute,
+  onCancel,
+  onRefineDir,
+  onRenameDir,
+}: DirectoryPreviewProps) {
   const paths = Object.keys(proposal.directoryTree).sort();
   const overflowPaths = new Set(proposal.overflowPaths ?? []);
   const stats = proposal.stats;
 
+  const renameLeaf = (path: string, nextLeaf: string) => {
+    const parent = path.split('/').slice(0, -1).join('/');
+    onRenameDir(path, parent ? `${parent}/${nextLeaf}` : nextLeaf);
+  };
+
   return (
     <div className="space-y-4">
       <h3 className="text-sm font-semibold text-gray-700">{t('organize.previewStep')}</h3>
+      <p className="text-xs text-gray-400">{t('organize.preview.renameHint')}</p>
 
       {(proposal.mergedFolderNames?.length ?? 0) > 1 && (
         <p className="text-[11px] text-gray-500">
@@ -48,6 +101,9 @@ export function DirectoryPreview({ proposal, onExecute, onCancel, onRefineDir }:
             <Stat label={t('organize.stats.overflowDirs')} value={stats.overflowDirectories} />
             <Stat label={t('organize.stats.unassigned')} value={stats.unassigned} />
           </div>
+          {stats.warning === 'nothing-to-do' && (
+            <p className="text-[11px] text-warning">{t('organize.stats.warnNothingToDo')}</p>
+          )}
           {stats.warning === 'threshold-too-high' && (
             <p className="text-[11px] text-warning">{t('organize.stats.warnThreshold')}</p>
           )}
@@ -57,35 +113,33 @@ export function DirectoryPreview({ proposal, onExecute, onCancel, onRefineDir }:
           {stats.warning === 'ai-unavailable' && (
             <p className="text-[11px] text-gray-500">{t('organize.stats.warnAi')}</p>
           )}
-          {stats.warning === 'nothing-to-do' && (
-            <p className="text-[11px] text-warning">{t('organize.stats.warnNothingToDo')}</p>
-          )}
           {stats.warning === 'ai-naming-failed' && (
             <p className="text-[11px] text-warning">{t('organize.stats.warnAiFailed')}</p>
           )}
         </div>
       )}
 
-      <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-1 font-mono text-sm">
+      <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-1 text-sm">
         {paths.map((path) => {
           const count = proposal.directoryTree[path].length;
           const isLowCohesion = proposal.lowCohesionPaths.includes(path);
           const isOverflow = overflowPaths.has(path);
           const depth = path.split('/').length - 1;
           const indent = '  '.repeat(depth);
-          const name = path.split('/').pop() ?? path;
 
           return (
             <div
               key={path}
               className={`flex items-center gap-2 ${isLowCohesion ? 'text-warning' : 'text-gray-700'}`}
             >
-              <span>
+              <span className="shrink-0 text-gray-400">
                 {indent}
-                {isOverflow ? '📌' : '📁'} {name} ({count})
+                {isOverflow ? '📌' : '📁'}
               </span>
+              <EditableName path={path} onCommit={(leaf) => renameLeaf(path, leaf)} />
+              <span className="shrink-0 text-xs text-gray-400">({count})</span>
               {isOverflow && (
-                <span className="text-[10px] text-gray-400" title={t('organize.overflowDir')}>
+                <span className="shrink-0 text-[10px] text-gray-400" title={t('organize.overflowDir')}>
                   {t('organize.overflowTag')}
                 </span>
               )}
@@ -93,7 +147,7 @@ export function DirectoryPreview({ proposal, onExecute, onCancel, onRefineDir }:
                 <button
                   onClick={() => onRefineDir(path)}
                   title={t('organize.lowCohesion')}
-                  className="text-warning hover:text-yellow-600"
+                  className="shrink-0 text-warning hover:text-yellow-600"
                 >
                   ⚡
                 </button>

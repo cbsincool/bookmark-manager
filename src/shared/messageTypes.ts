@@ -12,7 +12,7 @@ export type MessageRequest =
   | { type: 'ORGANIZE_DOMAIN_CLUSTER' }
   | { type: 'ORGANIZE_SEMANTIC_CLUSTER'; bookmarkIds: readonly string[] }
   | { type: 'ORGANIZE_CONNECTIVITY_CHECK'; bookmarkIds: readonly string[] }
-  | { type: 'ORGANIZE_AI_CLASSIFY_START'; bookmarkIds: readonly string[]; scope: 'global' | 'folder'; folderId?: string; categories?: readonly string[]; mode?: import('./types').OrganizeMode }
+  | { type: 'ORGANIZE_AI_CLASSIFY_START'; bookmarkIds: readonly string[]; scope: 'global' | 'folder'; folderId?: string; categories?: readonly string[]; mode?: import('./types').OrganizeMode; allowMoveOut?: boolean }
   | { type: 'ORGANIZE_AI_CLASSIFY_POLL'; taskId: string }
   | { type: 'ORGANIZE_EXECUTE'; directoryTree: Record<string, readonly string[]>; rootId: string }
   | { type: 'GET_FOLDER_STRUCTURE' }

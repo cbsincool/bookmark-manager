@@ -282,6 +282,7 @@ export function OrganizeWizard() {
         scope: 'folder',
         folderId: store.organizeFolderId,
         mode: store.organizeMode,
+        allowMoveOut: store.allowMoveOut,
       });
 
       if (!startResp?.success) throw new Error(startResp?.error || '启动失败');
@@ -342,7 +343,13 @@ export function OrganizeWizard() {
     store.setProcessing(true);
     try {
       const tree = await chrome.bookmarks.getTree();
-      const rootId = tree[0]?.children?.[0]?.id ?? '1';
+      const barId = tree[0]?.children?.[0]?.id ?? '1';
+      // 文件夹整理时新目录建在**该文件夹内部**，不是书签栏顶层。
+      // 此前一律用书签栏，于是「整理指定文件夹」会把书签搬出该文件夹。
+      const rootId =
+        store.organizeScope === 'folder' && store.organizeFolderId
+          ? store.organizeFolderId
+          : barId;
 
       const resp = await chrome.runtime.sendMessage({
         type: 'ORGANIZE_EXECUTE',
@@ -504,6 +511,22 @@ export function OrganizeWizard() {
               : t('organize.categoryStep')}
           </h3>
           <p className="text-xs text-gray-500">{t('organize.category.hint')}</p>
+          {store.organizeScope === 'folder' && (
+            <label className="flex items-start gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={store.allowMoveOut}
+                onChange={(e) => store.setAllowMoveOut(e.target.checked)}
+                className="mt-0.5 w-4 h-4 text-primary rounded"
+              />
+              <span>
+                <span className="block text-sm text-gray-700">{t('organize.allowMoveOut')}</span>
+                <span className="block text-xs text-gray-500">
+                  {t(store.allowMoveOut ? 'organize.allowMoveOutHint' : 'organize.keepInsideHint')}
+                </span>
+              </span>
+            </label>
+          )}
           {store.organizeMode === 'fit' && (
             <p className="text-xs text-gray-400">{t('organize.category.fitNote')}</p>
           )}
@@ -644,6 +667,7 @@ export function OrganizeWizard() {
           proposal={store.proposal}
           onExecute={handleExecute}
           onCancel={() => store.reset()}
+          onRenameDir={store.renamePath}
           onRefineDir={() => {}}
         />
       )}

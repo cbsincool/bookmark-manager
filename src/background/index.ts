@@ -117,7 +117,7 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
       return handleConnectivityCheck(msg.bookmarkIds);
 
     case 'ORGANIZE_AI_CLASSIFY_START':
-      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories, msg.mode);
+      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories, msg.mode, msg.allowMoveOut);
 
     case 'ORGANIZE_AI_CLASSIFY_POLL':
       return handleAIClassifyPoll(msg.taskId);
@@ -609,6 +609,7 @@ async function handleAIClassifyStart(
   folderId?: string,
   categories?: readonly string[],
   mode: OrganizeMode = 'fit',
+  allowMoveOut = false,
 ): Promise<{ taskId: string }> {
   const taskId = generateTaskId();
 
@@ -659,7 +660,17 @@ async function handleAIClassifyStart(
     bookmarks = filtered;
   }
 
-  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames).catch((err) => {
+  // 骨架的作用域：
+  //   全局整理        → 整个书签栏
+  //   文件夹整理      → **该文件夹内部**（默认），书签不会离开它；
+  //                     用户明确允许移出时，才换成整个书签栏
+  // 此前无论哪种都取整个书签栏，于是「整理指定文件夹」实际是把书签打散到全局，
+  // 新目录还建在书签栏顶层——和按钮上写的完全不是一回事。
+  const barId = await getRootFolderId();
+  const skeletonRootId =
+    scope === 'folder' && folderId && !allowMoveOut ? folderId : barId;
+
+  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames, skeletonRootId).catch((err) => {
     console.error('[Organize] Task failed:', taskId, err);
     const task = asyncTasks.get(taskId);
     if (task) {
@@ -830,6 +841,7 @@ async function processAIClassify(
   mode: OrganizeMode,
   userCategories?: readonly string[],
   mergedFolderNames: readonly string[] = [],
+  skeletonRootId?: string,
 ): Promise<void> {
   const task = asyncTasks.get(taskId);
   if (!task) return;
@@ -921,7 +933,7 @@ async function processAIClassify(
     let skeletonFromFolders = false;
 
     if (mode === 'fit') {
-      const rootFolderId = await getRootFolderId();
+      const rootFolderId = skeletonRootId ?? (await getRootFolderId());
       const folders = await getExistingFolders(rootFolderId);
       const usable = folders.filter(
         (f) =>
@@ -1079,7 +1091,7 @@ async function handleOrganizeExecute(
   // 预览与执行之间用户可能改了设置，这里以执行时的设置为准。
   const settings = await getSettings();
   const existingPaths = settings.onlyUseExistingDirectories
-    ? new Set(await getDirectoryPathsUnder(await getRootFolderId()))
+    ? new Set(await getDirectoryPathsUnder(rootId))
     : null;
 
   // 记录每个书签原本在哪个目录，整理结束后只清理这些被搬空的目录

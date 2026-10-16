@@ -204,9 +204,95 @@ def run_domain(page, seeded) -> int:
     return 0
 
 
+def run_folder(page, seeded) -> int:
+    """整理指定文件夹：新目录必须建在**该文件夹内部**，书签不能跑出去。"""
+    folder = seeded["folder"]
+    print(f"整理范围 = 文件夹「人工智能」(id={folder})，allowMoveOut=False\n")
+
+    start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                        "scope": "folder", "folderId": folder,
+                        "mode": MODE if MODE in ("fit", "replan") else "fit",
+                        "allowMoveOut": False}, 60_000)
+    tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
+    if not tid:
+        print("启动失败:", start.get("error"))
+        return 1
+
+    tree = None
+    for _ in range(240):
+        page.wait_for_timeout(2000)
+        task = (send(page, {"type": "ORGANIZE_AI_CLASSIFY_POLL", "taskId": tid}, 60_000)
+                .get("data") or {})
+        if task.get("status") == "completed":
+            tree = (task.get("result") or {}).get("directoryTree") or {}
+            break
+        if task.get("status") == "failed":
+            print("分类失败:", task.get("error"))
+            return 1
+
+    print(f"提案 {len(tree)} 个目录: {[(k, len(v)) for k, v in tree.items()]}")
+
+    # 执行：rootId 必须是该文件夹本身
+    exec_resp = send(page, {"type": "ORGANIZE_EXECUTE",
+                            "directoryTree": tree, "rootId": folder}, 300_000)
+    print(f"\n执行返回: success={exec_resp.get('success')} data={exec_resp.get('data')} "
+          f"err={exec_resp.get('error')}")
+
+    inside = page.evaluate(
+        """async ([id]) => {
+            const out = [];
+            const walk = async (fid, path) => {
+                for (const c of await chrome.bookmarks.getChildren(fid)) {
+                    if (c.url) continue;
+                    const p = path ? path + '/' + c.title : c.title;
+                    const kids = await chrome.bookmarks.getChildren(c.id);
+                    out.push({ path: p, bookmarks: kids.filter(k => k.url).length });
+                    await walk(c.id, p);
+                }
+            };
+            await walk(id, '');
+            return out;
+        }""",
+        [folder],
+    )
+    print("\n「人工智能」内部的子目录:")
+    for row in inside:
+        print(f"    {row['path']}  书签 {row['bookmarks']}")
+
+    direct = page.evaluate(
+        """async ([id]) => (await chrome.bookmarks.getChildren(id).catch(() => [])).filter(c => c.url).length""",
+        [folder],
+    )
+    outside = page.evaluate(
+        """async ([bar, folder]) => {
+            const out = [];
+            for (const c of await chrome.bookmarks.getChildren(bar)) {
+                if (c.url || c.id === folder) continue;
+                const kids = await chrome.bookmarks.getChildren(c.id);
+                out.push({ title: c.title, bookmarks: kids.filter(k => k.url).length });
+            }
+            return out;
+        }""",
+        [seeded["bar"], folder],
+    )
+
+    print(f"\n「人工智能」直属书签: {direct} 条（应全部进子目录）")
+    print(f"书签栏下**其它**目录（不该被动）: {outside or '（无）'}")
+
+    page.evaluate(
+        """async ([bar]) => {
+            for (const c of await chrome.bookmarks.getChildren(bar)) {
+                try { await chrome.bookmarks.removeTree(c.id); } catch (e) {}
+            }
+        }""",
+        [seeded["bar"]],
+    )
+    return 0
+
+
 def main() -> int:
     # 域名模式不调 AI，不需要凭证
-    if not AI_KEY and MODE != "domain":
+    if not AI_KEY and MODE not in ("domain",):
         print("缺少 BM_AI_KEY")
         return 2
 
@@ -265,6 +351,8 @@ def main() -> int:
 
         if MODE == "domain":
             return run_domain(page, seeded)
+        if MODE in ("folder", "folder-replan"):
+            return run_folder(page, seeded)
 
         # 整理
         start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],

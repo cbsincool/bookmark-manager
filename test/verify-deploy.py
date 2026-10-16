@@ -828,6 +828,66 @@ def main() -> int:
                    set(subset).issubset(produced),
                    f"缺失 {len(set(subset) - produced)} 条")
 
+        # ---- 文件夹整理必须待在文件夹内部 ----
+        # 此前骨架取自整个书签栏、新目录建在书签栏顶层——「整理指定文件夹」
+        # 实际是把书签打散到全局，和按钮上写的完全不是一回事
+        print("\n" + "=" * 64)
+        print("⑬ 文件夹整理（不越界）")
+        print("=" * 64)
+
+        seed_folder = seeded["folderId"]
+        bar_before = panel.evaluate(
+            """async ([bar]) => (await chrome.bookmarks.getChildren(bar)).map((c) => c.title).sort()""",
+            [bar_id],
+        )
+
+        start = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                             "scope": "folder", "folderId": seed_folder,
+                             "mode": "replan", "allowMoveOut": False}, 60_000)
+        folder_task = (start.get("data") or {}).get("taskId") if start.get("success") else None
+        folder_tree = None
+
+        if not folder_task:
+            record("文件夹整理：启动", False, f"err={start.get('error', '')}")
+        else:
+            for _ in range(240):
+                panel.wait_for_timeout(2000)
+                task = (send(panel, {"type": "ORGANIZE_AI_CLASSIFY_POLL",
+                                     "taskId": folder_task}, 60_000).get("data") or {})
+                if task.get("status") == "completed":
+                    folder_tree = (task.get("result") or {}).get("directoryTree") or {}
+                    break
+                if task.get("status") == "failed":
+                    record("文件夹整理：完成", False, str(task.get("error"))[:160])
+                    break
+
+        if folder_tree is not None:
+            exec_resp = send(panel, {"type": "ORGANIZE_EXECUTE",
+                                     "directoryTree": folder_tree,
+                                     "rootId": seed_folder}, 300_000)
+            record("文件夹整理：执行成功", exec_resp.get("success") is True,
+                   f"{exec_resp.get('data')} err={exec_resp.get('error', '')}")
+
+            inside = panel.evaluate(
+                """async ([id]) => {
+                    const sub = (await chrome.bookmarks.getChildren(id)).filter((c) => !c.url);
+                    const direct = (await chrome.bookmarks.getChildren(id)).filter((c) => c.url);
+                    return { subFolders: sub.length, directBookmarks: direct.length };
+                }""",
+                [seed_folder],
+            )
+            record("文件夹整理：新目录建在该文件夹内部",
+                   inside["subFolders"] > 0 and inside["directBookmarks"] == 0,
+                   f"子目录 {inside['subFolders']} 个，直属书签 {inside['directBookmarks']} 条")
+
+            bar_after = panel.evaluate(
+                """async ([bar]) => (await chrome.bookmarks.getChildren(bar)).map((c) => c.title).sort()""",
+                [bar_id],
+            )
+            record("文件夹整理：没有往书签栏顶层建目录",
+                   bar_after == bar_before,
+                   f"之前 {bar_before} → 之后 {bar_after}")
+
         # ---- 还原 AI 设置（凭证不留在 profile 里）----
         if AI_KEY and prev_settings:
             send(panel, {"type": "UPDATE_SETTINGS", "settings": {
