@@ -107,7 +107,9 @@ export function OrganizeWizard() {
         .filter((node) => !node.url && node.title && node.id !== store.organizeFolderId)
         .map((node) => node.title);
       setMoveOutCandidates(barFolders);
-      store.setMoveOutTargets(barFolders);
+      // 默认全不勾：勾选才作为移出目标。用户的心智是「勾哪个就移到哪个」，
+      // 默认全勾会逼他先取消再挑
+      store.setMoveOutTargets([]);
 
       const merged = new Set([...existingFolderNames, ...savedCategories]);
       const categories = Array.from(merged);

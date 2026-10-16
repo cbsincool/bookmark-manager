@@ -383,9 +383,96 @@ def run_folder_moveout(page, seeded) -> int:
     return 0
 
 
+def run_moveout_empty(page) -> int:
+    """复现用户场景：把「127.0.0.1」的内容移到一个**空**的「localhost」目录。
+
+    空目录没有成员向量、算不出中心，会被骨架过滤掉——书签匹配不上任何目录，
+    最后落进「未分类」。这正是用户看到的现象。
+    """
+    setup = page.evaluate(
+        """async () => {
+            const bar = (await chrome.bookmarks.getTree())[0].children[0].id;
+            const src = await chrome.bookmarks.create({ parentId: bar, title: '127.0.0.1' });
+            const dst = await chrome.bookmarks.create({ parentId: bar, title: 'localhost' });  // 空的
+            for (const [title, url] of [
+                ['本地开发服务器配置', 'http://127.0.0.1:3000/docs'],
+                ['本地 API 调试记录', 'http://127.0.0.1:8080/api'],
+                ['前端热更新说明', 'http://127.0.0.1:5173/guide'],
+                ['本地数据库连接', 'http://127.0.0.1:5432/notes'],
+                ['开发环境搭建', 'http://127.0.0.1:3000/setup'],
+            ]) {
+                await chrome.bookmarks.create({ parentId: src.id, title, url });
+            }
+            return { bar, src: src.id, dst: dst.id };
+        }""",
+    )
+    print(f"「127.0.0.1」(id={setup['src']}) 5 条  →  空目录「localhost」(id={setup['dst']})")
+    print("allowMoveOut=True，只勾选 localhost\n")
+
+    start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                        "scope": "folder", "folderId": setup["src"], "mode": "fit",
+                        "allowMoveOut": True, "moveOutTargets": ["localhost"]}, 60_000)
+    tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
+    if not tid:
+        print("启动失败:", start.get("error"))
+        return 1
+
+    tree = None
+    for _ in range(240):
+        page.wait_for_timeout(2000)
+        task = (send(page, {"type": "ORGANIZE_AI_CLASSIFY_POLL", "taskId": tid}, 60_000)
+                .get("data") or {})
+        if task.get("status") == "completed":
+            tree = (task.get("result") or {}).get("directoryTree") or {}
+            break
+        if task.get("status") == "failed":
+            print("分类失败:", task.get("error"))
+            return 1
+
+    print(f"提案 {len(tree)} 个目录:")
+    for path, ids in tree.items():
+        print(f"    {path}  ({len(ids)} 条)")
+    print(f"→ 有书签落到 localhost 吗: {'是' if any('localhost' in p for p in tree) else '否'}")
+
+    exec_resp = send(page, {"type": "ORGANIZE_EXECUTE",
+                            "directoryTree": tree, "rootId": setup["bar"]}, 300_000)
+    print(f"执行返回: {exec_resp.get('data')}")
+
+    after = page.evaluate(
+        """async ([bar]) => {
+            const out = [];
+            const walk = async (id, path) => {
+                for (const c of await chrome.bookmarks.getChildren(id)) {
+                    if (c.url) continue;
+                    const p = path ? path + '/' + c.title : c.title;
+                    const kids = await chrome.bookmarks.getChildren(c.id);
+                    out.push({ path: p, bookmarks: kids.filter(k => k.url).length });
+                    await walk(c.id, p);
+                }
+            };
+            await walk(bar, '');
+            return out;
+        }""",
+        [setup["bar"]],
+    )
+    print("\n执行后的书签栏结构:")
+    for row in after:
+        print(f"    {row['path']}  书签 {row['bookmarks']}")
+
+    page.evaluate(
+        """async ([bar]) => {
+            for (const c of await chrome.bookmarks.getChildren(bar)) {
+                try { await chrome.bookmarks.removeTree(c.id); } catch (e) {}
+            }
+        }""",
+        [setup["bar"]],
+    )
+    return 0
+
+
 def main() -> int:
     # 域名模式不调 AI，不需要凭证
-    if not AI_KEY and MODE not in ("domain",):
+    if not AI_KEY and MODE not in ("domain", "moveout-empty"):
         print("缺少 BM_AI_KEY")
         return 2
 
@@ -446,6 +533,8 @@ def main() -> int:
 
         if MODE == "domain":
             return run_domain(page, seeded)
+        if MODE == "moveout-empty":
+            return run_moveout_empty(page)
         if MODE == "folder-moveout":
             return run_folder_moveout(page, seeded)
         if MODE in ("folder", "folder-replan"):

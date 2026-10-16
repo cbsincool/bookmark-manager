@@ -18,7 +18,7 @@
   "organize.allowMoveOut": "Let bookmarks move out of this folder",
   "organize.allowMoveOutHint": "Uses the whole bookmark bar as reference; bookmarks that match another folder better will move there.",
   "organize.keepInsideHint": "Subdivides inside this folder only; bookmarks never leave it.",
-  "organize.moveOutTargets": "Bookmarks may move out to these folders (none checked = no restriction):",
+  "organize.moveOutTargets": "Bookmarks may move out to these folders (only checked ones; none checked = never leaves):",
   "organize.moveOutNoTargets": "No other folders under the bookmark bar - there is nowhere to move out to.",
   "organize.category.add": "Add Category",
   "organize.domainStep": "Domain Clustering",

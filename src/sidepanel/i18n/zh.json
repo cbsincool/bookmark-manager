@@ -18,7 +18,7 @@
   "organize.allowMoveOut": "允许书签移出这个文件夹",
   "organize.allowMoveOutHint": "以整个书签栏的目录为参照，与其它目录更匹配的书签会移出去。",
   "organize.keepInsideHint": "只在这个文件夹内部细分，书签不会离开它。",
-  "organize.moveOutTargets": "可移出到这些目录（不勾选则不限制）：",
+  "organize.moveOutTargets": "可移出到这些目录（勾选才生效，一个都不勾则不往外部移出）：",
   "organize.moveOutNoTargets": "书签栏下暂时没有别的目录，移出无处可去。",
   "organize.category.add": "添加目录",
   "organize.domainStep": "域名聚类",

@@ -394,6 +394,7 @@ export function averageVectors(vectors: readonly Float32Array[]): Float32Array {
 export function buildSkeletonFromFolders(
   folders: readonly { readonly path: string; readonly bookmarkIds: readonly string[] }[],
   vectorMap: ReadonlyMap<string, Float32Array>,
+  nameVectors?: ReadonlyMap<string, Float32Array>,
 ): SkeletonNode[] {
   const nodes: SkeletonNode[] = [];
 
@@ -401,12 +402,17 @@ export function buildSkeletonFromFolders(
     const vectors = folder.bookmarkIds
       .map((id) => vectorMap.get(id))
       .filter((v): v is Float32Array => v !== undefined);
-    if (vectors.length === 0) continue;
+
+    // 空目录没有成员向量可算中心，用**目录名**的向量兜底。
+    // 没有这个兜底，用户新建一个目录想往里移东西时它永远收不到书签——
+    // 因为它进不了骨架，书签匹配不上任何目录，最后落进「未分类」。
+    const centroid = vectors.length > 0 ? averageVectors(vectors) : nameVectors?.get(folder.path);
+    if (!centroid) continue;
 
     nodes.push({
       path: folder.path,
       memberIds: folder.bookmarkIds,
-      centroid: averageVectors(vectors),
+      centroid,
       isOverflow: false,
     });
   }

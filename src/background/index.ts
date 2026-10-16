@@ -679,15 +679,19 @@ async function handleAIClassifyStart(
   } else if (movingOut && folderId) {
     // 移出时路径要相对书签栏，才能既指向文件夹内部的子目录、又指向外面的目标目录
     const folderPath = (await getFolderPathRelativeTo(barId, folderId)) ?? '';
-    const allowed = [folderPath, ...(moveOutTargets ?? [])].filter(Boolean);
-    keepSkeletonPath = (path) => allowed.some((p) => path === p || path.startsWith(`${p}/`));
+    // 注意**不包含文件夹自己**：它的中心向量就是自己那批书签的均值，永远是最近匹配，
+    // 移出因此永远不会发生。只留它的子目录 + 勾选的目标。
+    const descendants = folderPath ? `${folderPath}/` : '';
+    const targets = (moveOutTargets ?? []).filter(Boolean);
+    keepSkeletonPath = (path) =>
+      (!!descendants && path.startsWith(descendants)) || targets.includes(path);
 
     // 关键：允许移出只是「书签可以去别的目录」，**新建的目录仍然要建在文件夹内部**。
     // 没有这个前缀的话，聚类/溢出产生的新目录会落到书签栏顶层。
     if (folderPath) newDirPrefix = `${folderPath}/`;
   }
 
-  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames, skeletonRootId, keepSkeletonPath, newDirPrefix).catch((err) => {
+  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames, skeletonRootId, keepSkeletonPath, newDirPrefix, moveOutTargets).catch((err) => {
     console.error('[Organize] Task failed:', taskId, err);
     const task = asyncTasks.get(taskId);
     if (task) {
@@ -861,6 +865,7 @@ async function processAIClassify(
   skeletonRootId?: string,
   keepSkeletonPath?: ((path: string) => boolean) | undefined,
   newDirPrefix = '',
+  forceIncludePaths: readonly string[] = [],
 ): Promise<void> {
   const task = asyncTasks.get(taskId);
   if (!task) return;
@@ -956,9 +961,11 @@ async function processAIClassify(
       const folders = (await getExistingFolders(rootFolderId)).filter(
         (f) => !keepSkeletonPath || keepSkeletonPath(f.path),
       );
+      // 用户勾选的移出目标即使为空也要纳入骨架（否则它永远收不到书签）
+      const forced = new Set(forceIncludePaths);
       const usable = folders.filter(
         (f) =>
-          f.bookmarkIds.length > 0 &&
+          (f.bookmarkIds.length > 0 || forced.has(f.path)) &&
           f.path !== UNCLASSIFIED_DIR &&
           !f.path.includes('[待删除_失效]'),
       );
@@ -987,7 +994,18 @@ async function processAIClassify(
         }
       }
 
-      skeleton = buildSkeletonFromFolders(usable, vectorMap);
+      // 空目录用目录名的向量兜底
+      const emptyFolders = usable.filter(
+        (f) => !f.bookmarkIds.some((id) => vectorMap.has(id)),
+      );
+      const nameVectors = new Map<string, Float32Array>();
+      if (emptyFolders.length > 0) {
+        const names = emptyFolders.map((f) => f.path.split('/').pop() ?? f.path);
+        const vectors = await generateEmbeddingsBatch(names);
+        emptyFolders.forEach((f, i) => nameVectors.set(f.path, vectors[i]));
+      }
+
+      skeleton = buildSkeletonFromFolders(usable, vectorMap, nameVectors);
       skeletonFromFolders = skeleton.length > 0;
     }
 
@@ -1053,14 +1071,46 @@ async function processAIClassify(
         assignment.overflowIds.length;
     }
 
+    // 勾了移出目标时，与所有目录都不匹配的书签**直接就近移入目标**。
+    // 目标是人手挑的，再卡相似度阈值只会让「我明明勾了它」变成「什么都没发生」。
+    let assignedBuckets = [...assignment.assigned];
+    let overflowIds = [...assignment.overflowIds];
+
+    const targetNodes = skeleton.filter((n) => forceIncludePaths.includes(n.path));
+    if (targetNodes.length > 0 && overflowIds.length > 0) {
+      const byPath = new Map(assignedBuckets.map((b) => [b.path, [...b.ids]]));
+      const rest: string[] = [];
+
+      for (const id of overflowIds) {
+        const vector = vectorMap.get(id);
+        if (!vector) {
+          rest.push(id);
+          continue;
+        }
+        let best = targetNodes[0];
+        let bestSim = -Infinity;
+        for (const node of targetNodes) {
+          const sim = cosineSimilarity(vector, node.centroid);
+          if (sim > bestSim) {
+            bestSim = sim;
+            best = node;
+          }
+        }
+        byPath.set(best.path, [...(byPath.get(best.path) ?? []), id]);
+      }
+
+      assignedBuckets = Array.from(byPath.entries()).map(([path, ids]) => ({ path, ids }));
+      overflowIds = rest;
+    }
+
     // --- 阶段 3：溢出成组 ---
     let overflowEntries: { path: string; ids: string[] }[] = [];
-    let unassignedIds = [...assignment.overflowIds];
+    let unassignedIds = [...overflowIds];
 
-    if (assignment.overflowIds.length > 0 && !settings.onlyUseExistingDirectories) {
-      updateProgress(0, assignment.overflowIds.length, `处理 ${assignment.overflowIds.length} 条未归位书签`);
+    if (overflowIds.length > 0 && !settings.onlyUseExistingDirectories) {
+      updateProgress(0, overflowIds.length, `处理 ${overflowIds.length} 条未归位书签`);
 
-      const overflowItems: OverflowItem[] = assignment.overflowIds
+      const overflowItems: OverflowItem[] = overflowIds
         .map((id) => {
           const vector = vectorMap.get(id);
           const bookmark = bookmarks.find((b) => b.id === id);
@@ -1080,13 +1130,13 @@ async function processAIClassify(
     }
 
     // --- 阶段 4：汇合 ---
-    const assignedIds = new Set(assignment.assigned.flatMap((b) => b.ids));
+    const assignedIds = new Set(assignedBuckets.flatMap((b) => b.ids));
     const accounted = new Set([...assignedIds, ...unassignedIds]);
     // 没有向量、因而没参与归位的书签，一并落进未分类——保证 Σ成员 + 未分类 === 总数
     unassignedIds = [...unassignedIds, ...bookmarks.filter((b) => !accounted.has(b.id)).map((b) => b.id)];
 
     const directoryTree = mergeDirectoryTree(
-      [...assignment.assigned.map((b) => ({ path: b.path, ids: [...b.ids] })), ...overflowEntries],
+      [...assignedBuckets.map((b) => ({ path: b.path, ids: [...b.ids] })), ...overflowEntries],
       unassignedIds,
       newDirPrefix ? `${newDirPrefix}${UNCLASSIFIED_DIR}` : UNCLASSIFIED_DIR,
     );
@@ -1094,7 +1144,7 @@ async function processAIClassify(
     const stats = statsFor({
       skeletonCount: skeleton.length,
       assigned: assignedIds.size,
-      overflow: assignment.overflowIds.length,
+      overflow: overflowIds.length,
       overflowDirectories: overflowEntries.length,
       unassigned: unassignedIds.length,
       warning:
