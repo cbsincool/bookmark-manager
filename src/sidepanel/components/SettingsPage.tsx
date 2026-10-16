@@ -254,6 +254,12 @@ export function SettingsPage() {
           {isRebuilding ? '重建中...' : t('settings.index.rebuild')}
         </button>
       </Section>
+
+      {/* 构建时间：确认当前跑的是哪一次构建。
+          重建 dist/ 后必须回 chrome://extensions 点扩展卡片的 🔄 才会生效。 */}
+      <p className="text-[10px] text-gray-300 text-center pt-2">
+        build {typeof __BUILD_TIME__ === 'string' ? __BUILD_TIME__ : 'dev'}
+      </p>
     </div>
   );
 }
