@@ -219,7 +219,7 @@ def run_folder(page, seeded) -> int:
 
     start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
                         "scope": "folder", "folderId": folder,
-                        "mode": MODE if MODE in ("fit", "replan") else "fit",
+                        "mode": "replan" if "replan" in MODE else "fit",
                         "allowMoveOut": False}, 60_000)
     tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
     if not tid:
@@ -410,7 +410,8 @@ def run_moveout_empty(page) -> int:
     print("allowMoveOut=True，只勾选 localhost\n")
 
     start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
-                        "scope": "folder", "folderId": setup["src"], "mode": "fit",
+                        "scope": "folder", "folderId": setup["src"],
+                        "mode": "replan" if "replan" in MODE else "fit",
                         "allowMoveOut": True, "moveOutTargets": ["localhost"]}, 60_000)
     tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
     if not tid:
@@ -533,7 +534,7 @@ def main() -> int:
 
         if MODE == "domain":
             return run_domain(page, seeded)
-        if MODE == "moveout-empty":
+        if MODE in ("moveout-empty", "moveout-empty-replan"):
             return run_moveout_empty(page)
         if MODE == "folder-moveout":
             return run_folder_moveout(page, seeded)

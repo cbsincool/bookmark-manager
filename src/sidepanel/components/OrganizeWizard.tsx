@@ -542,6 +542,9 @@ export function OrganizeWizard() {
           {store.organizeScope === 'folder' && store.allowMoveOut && (
             <div className="p-2 rounded-lg border border-gray-200 space-y-1">
               <p className="text-xs text-gray-500">{t('organize.moveOutTargets')}</p>
+              {store.organizeMode === 'replan' && (
+                <p className="text-xs text-amber-600">{t('organize.moveOutOverridesReplan')}</p>
+              )}
               {moveOutCandidates.length === 0 && (
                 <p className="text-xs text-gray-400">{t('organize.moveOutNoTargets')}</p>
               )}

@@ -18,6 +18,7 @@
   "organize.allowMoveOut": "Let bookmarks move out of this folder",
   "organize.allowMoveOutHint": "Uses the whole bookmark bar as reference; bookmarks that match another folder better will move there.",
   "organize.keepInsideHint": "Subdivides inside this folder only; bookmarks never leave it.",
+  "organize.moveOutOverridesReplan": "With a move-out target checked, \"Re-plan the folder structure\" no longer applies: re-planning creates new subfolders inside, and those always match, so nothing would ever move out.",
   "organize.moveOutTargets": "Bookmarks may move out to these folders (only checked ones; none checked = never leaves):",
   "organize.moveOutNoTargets": "No other folders under the bookmark bar - there is nowhere to move out to.",
   "organize.category.add": "Add Category",

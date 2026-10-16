@@ -956,7 +956,12 @@ async function processAIClassify(
     // 「已在该目录里」，不能拿来做「无需移动」的判断
     let skeletonFromFolders = false;
 
-    if (mode === 'fit') {
+    // 「移出到目标」和「重新规划结构」是互斥的：重新规划会在文件夹内部造出新的
+    // 子目录，而那些子目录一定匹配得上（书签就是它们的簇成员），移出永远不会发生。
+    // 所以勾了移出目标就按「现有目录」处理——没有子目录时，全部去目标。
+    const effectiveMode: OrganizeMode = forceIncludePaths.length > 0 ? 'fit' : mode;
+
+    if (effectiveMode === 'fit') {
       const rootFolderId = skeletonRootId ?? (await getRootFolderId());
       const folders = (await getExistingFolders(rootFolderId)).filter(
         (f) => !keepSkeletonPath || keepSkeletonPath(f.path),
@@ -1045,6 +1050,31 @@ async function processAIClassify(
         const existing = new Set(await getDirectoryPathsUnder(await getRootFolderId()));
         skeleton = skeleton.filter((node) => existing.has(node.path));
       }
+    }
+
+    // 勾选的移出目标必须**无论哪种模式**都在骨架里。
+    // replan 模式的骨架是重新聚类出来的，目标目录不在里面——不补进去的话
+    // 「允许移出」在那个模式下完全失效，书签会被细分在文件夹内部。
+    // （fit 模式下目标已在骨架里，mergeSkeletonByPath 会把重复的合掉。）
+    if (forceIncludePaths.length > 0) {
+      const rootFolderId = skeletonRootId ?? (await getRootFolderId());
+      const allFolders = await getExistingFolders(rootFolderId);
+      const targetFolders = allFolders.filter((f) => forceIncludePaths.includes(f.path));
+
+      const emptyTargets = targetFolders.filter(
+        (f) => !f.bookmarkIds.some((id) => vectorMap.has(id)),
+      );
+      const targetNameVectors = new Map<string, Float32Array>();
+      if (emptyTargets.length > 0) {
+        const names = emptyTargets.map((f) => f.path.split('/').pop() ?? f.path);
+        const vectors = await generateEmbeddingsBatch(names);
+        emptyTargets.forEach((f, i) => targetNameVectors.set(f.path, vectors[i]));
+      }
+
+      skeleton = [
+        ...skeleton,
+        ...buildSkeletonFromFolders(targetFolders, vectorMap, targetNameVectors),
+      ];
     }
 
     // 路径重复会让 bucketize 产出重复的桶（同一批书签被写进多个目录）
