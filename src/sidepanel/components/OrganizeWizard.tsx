@@ -628,13 +628,6 @@ export function OrganizeWizard() {
           onDeselectAll={() => {
             store.domainClusters.forEach((c) => { if (c.selected) store.toggleDomainCluster(c.domain); });
           }}
-          onSelectPending={() => {
-            // 已经全部在同一个目录里的域名勾选了也是白勾（移动是空操作），只选还没归位的
-            store.domainClusters.forEach((c) => {
-              const want = !c.existingFolder;
-              if (c.selected !== want) store.toggleDomainCluster(c.domain);
-            });
-          }}
           onNext={handleDomainNext}
           onBack={() => store.setStep('category')}
         />

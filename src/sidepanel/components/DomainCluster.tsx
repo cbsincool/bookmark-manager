@@ -8,12 +8,11 @@ interface DomainClusterProps {
   readonly onRename: (domain: string, name: string) => void;
   readonly onSelectAll: () => void;
   readonly onDeselectAll: () => void;
-  readonly onSelectPending: () => void;
   readonly onNext: () => void;
   readonly onBack: () => void;
 }
 
-export function DomainClusterView({ clusters, onToggle, onRename, onSelectAll, onDeselectAll, onSelectPending, onNext, onBack }: DomainClusterProps) {
+export function DomainClusterView({ clusters, onToggle, onRename, onSelectAll, onDeselectAll, onNext, onBack }: DomainClusterProps) {
   const selectedCount = clusters.filter((c) => c.selected).length;
 
   return (
@@ -24,7 +23,6 @@ export function DomainClusterView({ clusters, onToggle, onRename, onSelectAll, o
       <div className="flex gap-2 items-center">
         <span className="text-xs text-gray-400 flex-1">已选 {selectedCount}/{clusters.length} 个域名</span>
         <button onClick={onSelectAll} className="text-xs text-indigo-600 hover:underline">{t('organize.domainStep.selectAll')}</button>
-        <button onClick={onSelectPending} className="text-xs text-emerald-600 hover:underline">{t('organize.domainStep.selectPending')}</button>
         <button onClick={onDeselectAll} className="text-xs text-gray-500 hover:underline">{t('organize.domainStep.deselectAll')}</button>
       </div>
 

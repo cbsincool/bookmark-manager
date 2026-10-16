@@ -20,7 +20,6 @@
   "organize.domainStep.hint": "以下是所有书签域名，勾选希望按域名建立独立目录的；该域名的官网门户页（根页/首页）会一并归入，未勾选的书签继续进行 AI 语义分类",
   "organize.domainStep.inFolder": "已在 {path}",
   "organize.domainStep.inFolderHint": "该域名的书签已经全部收在对应的目录里了。勾选它通常什么都不会变，可以跳过。",
-  "organize.domainStep.selectPending": "只选未归位的",
   "organize.domainStep.selectAll": "全选",
   "organize.domainStep.deselectAll": "全不选",
   "organize.connectivityStep": "连通性检测",
