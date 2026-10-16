@@ -217,7 +217,7 @@ def main() -> int:
             print(f"    {row['path']}  书签 {row['bookmarks']}  子目录 {row['folders']}")
 
         still = page.evaluate(
-            """async ([id]) => (await chrome.bookmarks.getChildren(id)).filter(c => c.url).length""",
+            """async ([id]) => (await chrome.bookmarks.getChildren(id).catch(() => [])).filter(c => c.url).length""",
             [seeded["folder"]],
         )
         print(f"\n「人工智能」里还剩 {still} 条书签（原本 {len(seeded['ids'])} 条）")

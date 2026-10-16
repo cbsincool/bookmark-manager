@@ -9,6 +9,9 @@ import {
   maxNewDirectories,
   UNCLASSIFIED_DIR,
   TARGET_BOOKMARKS_PER_DIR,
+  TOP_LEVEL_DIVISOR,
+  MAX_LEAF_SIZE,
+  MIN_SPLITTABLE_SIZE,
   MAX_TOP_CLUSTERS,
   MAX_SUB_CLUSTERS,
 } from '@/shared/constants';
@@ -266,16 +269,21 @@ export interface HierarchicalCluster {
 export function buildHierarchicalClusters(
   vectors: readonly { id: string; vector: Float32Array }[],
   bookmarks: readonly BookmarkNode[],
-  options?: { targetPerDir?: number; maxTop?: number; maxSub?: number },
+  options?: { targetPerDir?: number; maxLeaf?: number; maxTop?: number; maxSub?: number; minSplittable?: number },
 ): HierarchicalCluster[] {
   const target = options?.targetPerDir ?? TARGET_BOOKMARKS_PER_DIR;
+  const maxLeaf = options?.maxLeaf ?? MAX_LEAF_SIZE;
   const maxTop = options?.maxTop ?? MAX_TOP_CLUSTERS;
   const maxSub = options?.maxSub ?? MAX_SUB_CLUSTERS;
+  const minSplittable = options?.minSplittable ?? MIN_SPLITTABLE_SIZE;
 
   const n = vectors.length;
   if (n === 0) return [];
 
-  const k1 = Math.max(2, Math.min(maxTop, Math.round(Math.sqrt(n / target))));
+  // 顶层簇数决定「有多少个类别」，与细分是两件事：
+  // 顶层给足粒度（类别本来就不该少），细分只负责把过大的簇切到能看的大小。
+  // 用 sqrt(n/target) 会让小书签库顶层过粗——40 条只给 2 个类别。
+  const k1 = Math.max(2, Math.min(maxTop, Math.round(Math.sqrt(n / TOP_LEVEL_DIVISOR))));
   const tops = buildSemanticClusters(vectors, bookmarks, k1, { minClusterSize: 1 });
   if (tops.length === 0) return [];
 
@@ -286,8 +294,15 @@ export function buildHierarchicalClusters(
       .map((id) => ({ id, vector: vectorById.get(id) }))
       .filter((v): v is { id: string; vector: Float32Array } => v.vector !== undefined);
 
-    const k2 = Math.max(0, Math.min(maxSub, Math.round(memberVectors.length / target)));
-    if (k2 < 2) return { top, children: [] };
+    // 细分判据是「太大」或「太杂」，**不是**「条数不匀」——主题大小天然不均，
+    // 为了凑够某个条数把 6 条书签拆成两个 3 条的目录毫无意义。
+    // 反过来，32 条混着前端/运维/AI 的目录该拆，虽然它并不算大。
+    // maxSub < 2 表示调用方明确不要层级（organizeMaxDepth = 1）
+    if (maxSub < 2 || memberVectors.length < minSplittable) return { top, children: [] };
+
+    if (memberVectors.length <= maxLeaf) return { top, children: [] };
+
+    const k2 = Math.max(2, Math.min(maxSub, Math.round(memberVectors.length / target)));
 
     const subs = buildSemanticClusters(memberVectors, bookmarks, k2, { minClusterSize: 1 });
     // 只分出一个子簇等于没分

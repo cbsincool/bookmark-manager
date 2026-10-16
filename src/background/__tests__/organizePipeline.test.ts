@@ -275,18 +275,42 @@ describe('buildHierarchicalClusters', () => {
     return { vectors, bookmarks: vectors.map((v) => bm(v.id, `${v.id} 标题`)) };
   }
 
-  it('keeps leaf directories near the target size instead of one big dumping ground', () => {
-    // 单层聚类时 40 条书签只给 k=3，实测出现 32 条一个目录的垃圾桶
-    const { vectors, bookmarks } = makeCorpus(40, 8);
-    const groups = buildHierarchicalClusters(vectors, bookmarks, { targetPerDir: 12 });
+  it('does not split a small, coherent cluster', () => {
+    // 20 条讲的是同一件事：内聚度高、条数也不多 → 不该为了「均分」被拆开
+    const vectors = Array.from({ length: 20 }, (_, i) => ({
+      id: `p${i}`,
+      vector: unit(1, 0.001 * i, 0, 0),
+    }));
+    const groups = buildHierarchicalClusters(
+      vectors,
+      vectors.map((v) => bm(v.id, v.id)),
+      { maxLeaf: 40 },
+    );
+
+    expect(groups.length).toBeGreaterThan(0);
+    expect(groups.every((g) => g.children.length === 0)).toBe(true);
+  });
+
+  it('does not split clusters that are already a reasonable size', () => {
+    // 判据是「过大」而不是「不均」：32 条分成两个 16 条的目录就够了，不必再切
+    const { vectors, bookmarks } = makeCorpus(32, 8);
+    const groups = buildHierarchicalClusters(vectors, bookmarks, { maxLeaf: 25 });
+
+    expect(groups.length).toBeGreaterThan(0);
+    expect(groups.every((g) => g.children.length === 0)).toBe(true);
+  });
+
+  it('splits a cluster that is genuinely too big', () => {
+    const { vectors, bookmarks } = makeCorpus(400, 2);
+    const groups = buildHierarchicalClusters(vectors, bookmarks, { targetPerDir: 12, maxLeaf: 25 });
 
     const leaves = groups.flatMap((g) =>
       g.children.length > 0 ? g.children.map((c) => c.bookmarkIds.length) : [g.top.bookmarkIds.length],
     );
 
-    expect(leaves.length).toBeGreaterThan(2);
-    expect(Math.max(...leaves)).toBeLessThanOrEqual(20);
-    expect(leaves.reduce((a, b) => a + b, 0)).toBe(40);
+    expect(leaves.length).toBeGreaterThan(groups.length);
+    expect(Math.max(...leaves)).toBeLessThanOrEqual(50); // 允许 k-means 切得不均
+    expect(leaves.reduce((a, b) => a + b, 0)).toBe(400);
   });
 
   it('does not subdivide when the sub-level is disabled', () => {
