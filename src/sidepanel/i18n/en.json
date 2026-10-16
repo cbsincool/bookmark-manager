@@ -37,6 +37,7 @@
   "organize.execute.skipped": "skipped",
   "organize.execute.pruned": "empty folders pruned",
   "organize.execute.failed": "failed",
+  "organize.execute.paths": "Directories written",
   "organize.execute": "Execute",
   "organize.skip": "Skip",
   "organize.next": "Next",

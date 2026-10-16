@@ -37,6 +37,7 @@
   "organize.execute.skipped": "跳过",
   "organize.execute.pruned": "清理空目录",
   "organize.execute.failed": "失败",
+  "organize.execute.paths": "实际写入的目录",
   "organize.execute": "执行",
   "organize.skip": "跳过",
   "organize.next": "下一步",

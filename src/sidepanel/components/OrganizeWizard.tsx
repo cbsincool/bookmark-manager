@@ -374,7 +374,7 @@ export function OrganizeWizard() {
         // 「本来就在这个目录」的空操作，用户看不出整理到底动没动
         const r = (resp.data ?? {}) as {
           moved?: number; inPlace?: number; skipped?: number;
-          pruned?: number; failed?: number; failures?: string[];
+          pruned?: number; failed?: number; failures?: string[]; paths?: string[];
         };
         const parts = [
           `${t('organize.execute.moved')} ${r.moved ?? 0}`,
@@ -383,6 +383,18 @@ export function OrganizeWizard() {
         if (r.skipped) parts.push(`${t('organize.execute.skipped')} ${r.skipped}`);
         if (r.pruned) parts.push(`${t('organize.execute.pruned')} ${r.pruned}`);
         if (r.failed) parts.push(`${t('organize.execute.failed')} ${r.failed}`);
+
+        // 把实际用到的目录路径也显示出来——「东西被建到哪儿去了」原本完全看不见，
+        // 排查「没移到我指定的目录」这类问题时只能靠猜
+        if (r.paths?.length) {
+          setProgressMsg(
+            `${t('organize.execute.done')} — ${parts.join('，')}
+` +
+            `${t('organize.execute.paths')}: ${r.paths.slice(0, 12).join('、')}`,
+          );
+          if (!r.failed) setTimeout(() => { store.reset(); setProgressMsg(''); }, 8000);
+          return;
+        }
 
         setProgressMsg(`${t('organize.execute.done')} — ${parts.join('，')}`);
         if (r.failures?.length) setErrorMsg(r.failures.join('\n'));
