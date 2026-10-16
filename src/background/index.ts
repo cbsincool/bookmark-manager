@@ -9,7 +9,7 @@ import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
 import { cosineSimilarity } from '@/shared/vectorSearch';
 import { suggestDirectoryName, normalizeDirectoryPath } from '@/shared/directoryNaming';
-import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS, MAX_SUB_CLUSTERS } from '@/shared/constants';
+import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, LEGACY_DEFAULT_CATEGORIES, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS, MAX_SUB_CLUSTERS } from '@/shared/constants';
 import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats, OrganizeMode } from '@/shared/types';
 import type { MessageRequest, MessageResponse, AsyncTask } from '@/shared/messageTypes';
 
@@ -42,6 +42,16 @@ async function getSettings(): Promise<AppSettings> {
   // 里 stored 优先，光改默认值对老用户不生效。只迁移 endpoint 盖不住这种情况。
   if (stored?.apiModel && DEPRECATED_API_MODELS.includes(stored.apiModel)) {
     return { ...merged, apiModel: DEFAULT_SETTINGS.apiModel };
+  }
+
+  // 清掉出厂硬编码的一级目录：它们不在用户收藏夹里，却会在「一级目录配置」中
+  // 显示成已有目录。用户真有同名文件夹的话会从收藏夹结构重新出现。
+  const categories = stored?.topLevelCategories;
+  if (categories?.length) {
+    const kept = categories.filter((c) => !LEGACY_DEFAULT_CATEGORIES.includes(c));
+    if (kept.length !== categories.length) {
+      return { ...merged, topLevelCategories: kept };
+    }
   }
 
   return merged;

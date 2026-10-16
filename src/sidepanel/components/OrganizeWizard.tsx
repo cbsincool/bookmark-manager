@@ -504,6 +504,9 @@ export function OrganizeWizard() {
               : t('organize.categoryStep')}
           </h3>
           <p className="text-xs text-gray-500">{t('organize.category.hint')}</p>
+          {store.organizeMode === 'fit' && (
+            <p className="text-xs text-gray-400">{t('organize.category.fitNote')}</p>
+          )}
 
           <div className="flex flex-wrap gap-2">
             {store.categories.map((cat) => (

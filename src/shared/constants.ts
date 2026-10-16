@@ -135,8 +135,19 @@ export const DEFAULT_SETTINGS: import('./types').AppSettings = {
   urlNormStripTrailingSlash: true,
   urlNormStripHash: true,
   language: 'en',
-  topLevelCategories: ['技术文档', '兴趣爱好', '工作相关', '学习资料', '生活实用', '其他'],
+  // 不预置任何一级目录：它会被向导合并进「一级目录配置」并显示成用户已有的目录，
+  // 但收藏夹里根本没有它们。真正的来源是收藏夹结构（见 proceedToCategory）。
+  topLevelCategories: [],
 };
+
+/**
+ * 出厂时硬编码的一级目录。它们并不来自用户收藏夹，却被向导合并进「一级目录配置」
+ * 并显示成「已有目录」，还会被存回设置长期驻留。读取设置时清掉——
+ * 若用户真有同名文件夹，会从收藏夹结构里重新出现，不会丢。
+ */
+export const LEGACY_DEFAULT_CATEGORIES: readonly string[] = [
+  '技术文档', '兴趣爱好', '工作相关', '学习资料', '生活实用', '其他',
+];
 
 // L1 评分用知名域名列表
 export const WELL_KNOWN_DOMAINS = [

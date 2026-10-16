@@ -192,6 +192,13 @@ def main() -> int:
         record("GET_SETTINGS", r.get("success") is True,
                f"apiFormat={settings.get('apiFormat')} model={settings.get('apiModel')}")
 
+        # 出厂硬编码的一级目录不该出现：它们不在用户收藏夹里，却会在向导的
+        # 「一级目录配置」里显示成已有目录（用户实测反馈过这个困惑）
+        injected = [c for c in (settings.get("topLevelCategories") or [])
+                    if c in ("技术文档", "兴趣爱好", "工作相关", "学习资料", "生活实用", "其他")]
+        record("设置里不注入出厂默认的一级目录", not injected,
+               f"topLevelCategories={settings.get('topLevelCategories')}")
+
         # ---- 注入测试书签 ----
         print("\n" + "=" * 64)
         print("② 注入受控测试书签")
