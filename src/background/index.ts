@@ -1,4 +1,4 @@
-import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder, getExistingFolders, resolveMergeGroup, collectSubtreeBookmarkIds } from './bookmarkService';
+import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder, getExistingFolders, resolveMergeGroup, collectSubtreeBookmarkIds, getFolderPathRelativeTo } from './bookmarkService';
 import { generateEmbedding, generateEmbeddingsBatch } from './embeddingClient';
 import { rerank } from './rerankerClient';
 import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2Content, scoreL3, buildDedupGroups } from './dedupEngine';
@@ -117,7 +117,7 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
       return handleConnectivityCheck(msg.bookmarkIds);
 
     case 'ORGANIZE_AI_CLASSIFY_START':
-      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories, msg.mode, msg.allowMoveOut);
+      return handleAIClassifyStart(msg.bookmarkIds, msg.scope, msg.folderId, msg.categories, msg.mode, msg.allowMoveOut, msg.moveOutTargets);
 
     case 'ORGANIZE_AI_CLASSIFY_POLL':
       return handleAIClassifyPoll(msg.taskId);
@@ -610,6 +610,7 @@ async function handleAIClassifyStart(
   categories?: readonly string[],
   mode: OrganizeMode = 'fit',
   allowMoveOut = false,
+  moveOutTargets: readonly string[] = [],
 ): Promise<{ taskId: string }> {
   const taskId = generateTaskId();
 
@@ -662,15 +663,31 @@ async function handleAIClassifyStart(
 
   // 骨架的作用域：
   //   全局整理        → 整个书签栏
-  //   文件夹整理      → **该文件夹内部**（默认），书签不会离开它；
-  //                     用户明确允许移出时，才换成整个书签栏
+  //   文件夹整理（默认）→ **该文件夹内部**，书签不会离开它
+  //   文件夹整理（允许移出）→ 该文件夹内部 + 用户勾选的移出目标目录
   // 此前无论哪种都取整个书签栏，于是「整理指定文件夹」实际是把书签打散到全局，
   // 新目录还建在书签栏顶层——和按钮上写的完全不是一回事。
   const barId = await getRootFolderId();
-  const skeletonRootId =
-    scope === 'folder' && folderId && !allowMoveOut ? folderId : barId;
+  const movingOut = scope === 'folder' && !!folderId && allowMoveOut;
 
-  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames, skeletonRootId).catch((err) => {
+  let skeletonRootId = barId;
+  let keepSkeletonPath: ((path: string) => boolean) | undefined;
+  let newDirPrefix = '';
+
+  if (scope === 'folder' && folderId && !allowMoveOut) {
+    skeletonRootId = folderId;
+  } else if (movingOut && folderId) {
+    // 移出时路径要相对书签栏，才能既指向文件夹内部的子目录、又指向外面的目标目录
+    const folderPath = (await getFolderPathRelativeTo(barId, folderId)) ?? '';
+    const allowed = [folderPath, ...(moveOutTargets ?? [])].filter(Boolean);
+    keepSkeletonPath = (path) => allowed.some((p) => path === p || path.startsWith(`${p}/`));
+
+    // 关键：允许移出只是「书签可以去别的目录」，**新建的目录仍然要建在文件夹内部**。
+    // 没有这个前缀的话，聚类/溢出产生的新目录会落到书签栏顶层。
+    if (folderPath) newDirPrefix = `${folderPath}/`;
+  }
+
+  processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames, skeletonRootId, keepSkeletonPath, newDirPrefix).catch((err) => {
     console.error('[Organize] Task failed:', taskId, err);
     const task = asyncTasks.get(taskId);
     if (task) {
@@ -842,6 +859,8 @@ async function processAIClassify(
   userCategories?: readonly string[],
   mergedFolderNames: readonly string[] = [],
   skeletonRootId?: string,
+  keepSkeletonPath?: ((path: string) => boolean) | undefined,
+  newDirPrefix = '',
 ): Promise<void> {
   const task = asyncTasks.get(taskId);
   if (!task) return;
@@ -934,7 +953,9 @@ async function processAIClassify(
 
     if (mode === 'fit') {
       const rootFolderId = skeletonRootId ?? (await getRootFolderId());
-      const folders = await getExistingFolders(rootFolderId);
+      const folders = (await getExistingFolders(rootFolderId)).filter(
+        (f) => !keepSkeletonPath || keepSkeletonPath(f.path),
+      );
       const usable = folders.filter(
         (f) =>
           f.bookmarkIds.length > 0 &&
@@ -942,6 +963,30 @@ async function processAIClassify(
           !f.path.includes('[待删除_失效]'),
       );
       updateProgress(0, usable.length, `读取现有目录 (${usable.length} 个)`);
+
+      // 骨架目录里的书签**必须**有向量，否则 buildSkeletonFromFolders 会把该目录
+      // 整个跳过——于是「哪些目录参与归位」取决于哪些书签碰巧建过索引，很任意。
+      // 移出目标这种刚建、或从没跑过索引重建的目录会因此永远收不到书签。
+      const skeletonIds = usable.flatMap((f) => f.bookmarkIds);
+      const missingVectors = skeletonIds.filter((id) => !vectorMap.has(id));
+      if (missingVectors.length > 0) {
+        const all = await getAllBookmarks();
+        const textById = new Map(all.map((b) => [b.id, `${b.title} ${b.url}`]));
+        updateProgress(0, missingVectors.length, `补齐目录向量 (0/${missingVectors.length})`);
+
+        for (let i = 0; i < missingVectors.length; i += BATCH_SIZE) {
+          const batch = missingVectors.slice(i, i + BATCH_SIZE);
+          const texts = batch.map((id) => textById.get(id) ?? '');
+          const vectors = await generateEmbeddingsBatch(texts);
+          for (let j = 0; j < batch.length; j++) {
+            vectorMap.set(batch[j], vectors[j]);
+            await db.putVector({
+              id: batch[j], vector: vectors[j], text: texts[j], updatedAt: Date.now(),
+            });
+          }
+        }
+      }
+
       skeleton = buildSkeletonFromFolders(usable, vectorMap);
       skeletonFromFolders = skeleton.length > 0;
     }
@@ -970,7 +1015,10 @@ async function processAIClassify(
       namedWithAi = naming.usedAi;
       namingDetail = naming.detail;
 
-      skeleton = buildHierarchicalSkeleton(groups, naming.paths, vectorMap);
+      skeleton = buildHierarchicalSkeleton(groups, naming.paths, vectorMap).map((node) => ({
+        ...node,
+        path: newDirPrefix ? `${newDirPrefix}${node.path}` : node.path,
+      }));
 
       // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
       // 必须用 getDirectoryPathsUnder（相对书签栏）——findOrCreateFolderPath 的基准
@@ -1025,7 +1073,7 @@ async function processAIClassify(
       const names = await nameOverflowGroups(overflow.groups, settings, canUseAI);
 
       overflowEntries = overflow.groups.map((group, i) => ({
-        path: names[i],
+        path: newDirPrefix ? `${newDirPrefix}${names[i]}` : names[i],
         ids: [...group.ids],
       }));
       unassignedIds = [...overflow.unassignedIds];
@@ -1040,6 +1088,7 @@ async function processAIClassify(
     const directoryTree = mergeDirectoryTree(
       [...assignment.assigned.map((b) => ({ path: b.path, ids: [...b.ids] })), ...overflowEntries],
       unassignedIds,
+      newDirPrefix ? `${newDirPrefix}${UNCLASSIFIED_DIR}` : UNCLASSIFIED_DIR,
     );
 
     const stats = statsFor({

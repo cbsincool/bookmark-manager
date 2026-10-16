@@ -10,6 +10,8 @@ interface OrganizeState {
   readonly organizeMode: OrganizeMode;
   /** 文件夹整理时是否允许书签移出该文件夹（默认否：只在内部细分） */
   readonly allowMoveOut: boolean;
+  /** 允许移出的目标目录（相对书签栏的路径）。空 = 不限制 */
+  readonly moveOutTargets: readonly string[];
   readonly organizeFolderId: string;
   readonly organizeFolderName: string;
   readonly domainClusters: readonly DomainCluster[];
@@ -21,6 +23,8 @@ interface OrganizeState {
   readonly setOrganizeScope: (s: OrganizeScope, folderId?: string, folderName?: string) => void;
   readonly setOrganizeMode: (m: OrganizeMode) => void;
   readonly setAllowMoveOut: (v: boolean) => void;
+  readonly toggleMoveOutTarget: (path: string) => void;
+  readonly setMoveOutTargets: (paths: readonly string[]) => void;
   readonly setDomainClusters: (c: DomainCluster[]) => void;
   readonly toggleDomainCluster: (domain: string) => void;
   readonly updateFolderName: (domain: string, name: string) => void;
@@ -39,6 +43,7 @@ export const useOrganizeStore = create<OrganizeState>((set, get) => ({
   organizeScope: 'global',
   organizeMode: 'fit',
   allowMoveOut: false,
+  moveOutTargets: [],
   organizeFolderId: '',
   organizeFolderName: '',
   domainClusters: [],
@@ -51,6 +56,15 @@ export const useOrganizeStore = create<OrganizeState>((set, get) => ({
     set({ organizeScope, organizeFolderId, organizeFolderName }),
   setOrganizeMode: (organizeMode) => set({ organizeMode }),
   setAllowMoveOut: (allowMoveOut) => set({ allowMoveOut }),
+  toggleMoveOutTarget: (path) => {
+    const current = get().moveOutTargets;
+    set({
+      moveOutTargets: current.includes(path)
+        ? current.filter((p) => p !== path)
+        : [...current, path],
+    });
+  },
+  setMoveOutTargets: (moveOutTargets) => set({ moveOutTargets: [...moveOutTargets] }),
   setDomainClusters: (domainClusters) => set({ domainClusters }),
   toggleDomainCluster: (domain) => {
     const clusters = get().domainClusters.map((c) =>
@@ -100,6 +114,7 @@ export const useOrganizeStore = create<OrganizeState>((set, get) => ({
     organizeScope: 'global',
     organizeMode: 'fit',
     allowMoveOut: false,
+    moveOutTargets: [],
     organizeFolderId: '',
     organizeFolderName: '',
     domainClusters: [],

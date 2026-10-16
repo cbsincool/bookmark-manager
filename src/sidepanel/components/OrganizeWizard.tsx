@@ -16,6 +16,7 @@ interface FolderInfo {
 export function OrganizeWizard() {
   const store = useOrganizeStore();
   const [progressMsg, setProgressMsg] = useState('');
+  const [moveOutCandidates, setMoveOutCandidates] = useState<string[]>([]);
   const [errorMsg, setErrorMsg] = useState('');
   const [newCategory, setNewCategory] = useState('');
   const [existingFolders, setExistingFolders] = useState<FolderInfo[]>([]);
@@ -100,6 +101,13 @@ export function OrganizeWizard() {
       const savedCategories: string[] = settingsResp?.success
         ? (settingsResp.data as { topLevelCategories: string[] }).topLevelCategories ?? []
         : [];
+
+      // 允许移出时的候选目标：书签栏的顶层目录（不含当前选中的文件夹本身）
+      const barFolders = rootChildren
+        .filter((node) => !node.url && node.title && node.id !== store.organizeFolderId)
+        .map((node) => node.title);
+      setMoveOutCandidates(barFolders);
+      store.setMoveOutTargets(barFolders);
 
       const merged = new Set([...existingFolderNames, ...savedCategories]);
       const categories = Array.from(merged);
@@ -283,6 +291,7 @@ export function OrganizeWizard() {
         folderId: store.organizeFolderId,
         mode: store.organizeMode,
         allowMoveOut: store.allowMoveOut,
+        moveOutTargets: store.moveOutTargets,
       });
 
       if (!startResp?.success) throw new Error(startResp?.error || '启动失败');
@@ -346,8 +355,9 @@ export function OrganizeWizard() {
       const barId = tree[0]?.children?.[0]?.id ?? '1';
       // 文件夹整理时新目录建在**该文件夹内部**，不是书签栏顶层。
       // 此前一律用书签栏，于是「整理指定文件夹」会把书签搬出该文件夹。
+      // 允许移出时路径必须相对书签栏（既要指向文件夹内部的子目录，又要指向外面的目标目录）
       const rootId =
-        store.organizeScope === 'folder' && store.organizeFolderId
+        store.organizeScope === 'folder' && store.organizeFolderId && !store.allowMoveOut
           ? store.organizeFolderId
           : barId;
 
@@ -526,6 +536,34 @@ export function OrganizeWizard() {
                 </span>
               </span>
             </label>
+          )}
+          {store.organizeScope === 'folder' && store.allowMoveOut && (
+            <div className="p-2 rounded-lg border border-gray-200 space-y-1">
+              <p className="text-xs text-gray-500">{t('organize.moveOutTargets')}</p>
+              {moveOutCandidates.length === 0 && (
+                <p className="text-xs text-gray-400">{t('organize.moveOutNoTargets')}</p>
+              )}
+              <div className="flex flex-wrap gap-1">
+                {moveOutCandidates.map((name) => (
+                  <label
+                    key={name}
+                    className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-xs cursor-pointer ${
+                      store.moveOutTargets.includes(name)
+                        ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
+                        : 'border-gray-200 text-gray-600'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={store.moveOutTargets.includes(name)}
+                      onChange={() => store.toggleMoveOutTarget(name)}
+                      className="w-3 h-3"
+                    />
+                    {name}
+                  </label>
+                ))}
+              </div>
+            </div>
           )}
           {store.organizeMode === 'fit' && (
             <p className="text-xs text-gray-400">{t('organize.category.fitNote')}</p>

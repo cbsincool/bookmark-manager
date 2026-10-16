@@ -60,7 +60,10 @@ function EditableName({ path, onCommit }: EditableNameProps) {
         if (e.key === 'Escape') { setDraft(leaf); (e.target as HTMLInputElement).blur(); }
       }}
       spellCheck={false}
-      className="min-w-0 flex-1 px-1 py-0.5 text-sm border border-transparent rounded hover:border-gray-200 focus:border-indigo-400 focus:outline-none bg-transparent"
+      title={t('organize.preview.renameTitle')}
+      className="min-w-0 flex-1 px-1.5 py-0.5 text-sm border border-dashed border-gray-300 rounded
+                 hover:border-solid hover:border-indigo-300 hover:bg-indigo-50/40
+                 focus:border-solid focus:border-indigo-400 focus:bg-white focus:outline-none"
     />
   );
 }

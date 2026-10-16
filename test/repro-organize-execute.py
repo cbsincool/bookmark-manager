@@ -26,7 +26,10 @@ AI_FORMAT = os.environ.get("BM_AI_FORMAT", "")
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "fit"
 
-# 域名模式用：5 个域名各 6 条，模拟「按域名建目录」
+
+# 移出模式用：一个以 AI/ML 为主的文件夹里混进 3 条放错的（露营/咖啡/宠物）。
+# 用 40 条横跨 8 个主题的混合文件夹测不出移出——那种文件夹的中心是模糊平均值，
+# 什么都能匹配上，书签根本没有「明显不匹配」的机会。
 DOMAIN_SEEDS = [
     (f"{name} {i}", f"https://{host}/doc/{i}")
     for host, name in [
@@ -82,6 +85,11 @@ SEEDS = [
     ("咖啡手冲参数", "https://example.com/coffee"),
     ("宠物疫苗时间表", "https://example.com/pet"),
 ]
+
+# 移出模式用：一个以 AI/ML 为主的文件夹里混进 3 条放错的（露营/咖啡/宠物）。
+# 用 40 条横跨 8 个主题的混合文件夹测不出移出——那种文件夹的中心是模糊平均值，
+# 什么都能匹配上，书签根本没有「明显不匹配」的机会。
+MOVEOUT_SEEDS = SEEDS[:20] + SEEDS[37:]
 
 
 def send(page, msg: dict, timeout: int = 120_000):
@@ -290,6 +298,91 @@ def run_folder(page, seeded) -> int:
     return 0
 
 
+def run_folder_moveout(page, seeded) -> int:
+    """允许移出：书签可以去勾选的目标目录，但**新目录仍要建在文件夹内部**。"""
+    folder = seeded["folder"]
+
+    # 在书签栏下建一个「露营咖啡」目录，放 3 条与种子里同主题的书签
+    target = page.evaluate(
+        """async ([bar]) => {
+            const f = await chrome.bookmarks.create({ parentId: bar, title: '露营咖啡' });
+            for (const [title, url] of [
+                ['露营装备清单', 'https://example.com/camping'],
+                ['咖啡手冲参数', 'https://example.com/coffee'],
+                ['宠物疫苗时间表', 'https://example.com/pet'],
+            ]) {
+                await chrome.bookmarks.create({ parentId: f.id, title, url });
+            }
+            return f.id;
+        }""",
+        [seeded["bar"]],
+    )
+    print(f"目标目录「露营咖啡」(id={target})，allowMoveOut=True，只勾选它\n")
+
+    start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                        "scope": "folder", "folderId": folder, "mode": "fit",
+                        "allowMoveOut": True, "moveOutTargets": ["露营咖啡"]}, 60_000)
+    tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
+    if not tid:
+        print("启动失败:", start.get("error"))
+        return 1
+
+    tree = None
+    for _ in range(240):
+        page.wait_for_timeout(2000)
+        task = (send(page, {"type": "ORGANIZE_AI_CLASSIFY_POLL", "taskId": tid}, 60_000)
+                .get("data") or {})
+        if task.get("status") == "completed":
+            tree = (task.get("result") or {}).get("directoryTree") or {}
+            break
+        if task.get("status") == "failed":
+            print("分类失败:", task.get("error"))
+            return 1
+
+    print(f"提案 {len(tree)} 个目录:")
+    for path, ids in tree.items():
+        print(f"    {path}  ({len(ids)} 条)")
+
+    outside = [p for p in tree if not p.startswith("人工智能")]
+    print(f"\n指向文件夹外的目录: {outside}")
+
+    exec_resp = send(page, {"type": "ORGANIZE_EXECUTE",
+                            "directoryTree": tree, "rootId": seeded["bar"]}, 300_000)
+    print(f"执行返回: success={exec_resp.get('success')} data={exec_resp.get('data')} "
+          f"err={exec_resp.get('error')}")
+
+    after = page.evaluate(
+        """async ([bar]) => {
+            const out = [];
+            const walk = async (id, path) => {
+                for (const c of await chrome.bookmarks.getChildren(id)) {
+                    if (c.url) continue;
+                    const p = path ? path + '/' + c.title : c.title;
+                    const kids = await chrome.bookmarks.getChildren(c.id);
+                    out.push({ path: p, bookmarks: kids.filter(k => k.url).length });
+                    await walk(c.id, p);
+                }
+            };
+            await walk(bar, '');
+            return out;
+        }""",
+        [seeded["bar"]],
+    )
+    print("\n执行后的书签栏结构:")
+    for row in after:
+        print(f"    {row['path']}  书签 {row['bookmarks']}")
+
+    page.evaluate(
+        """async ([bar]) => {
+            for (const c of await chrome.bookmarks.getChildren(bar)) {
+                try { await chrome.bookmarks.removeTree(c.id); } catch (e) {}
+            }
+        }""",
+        [seeded["bar"]],
+    )
+    return 0
+
+
 def main() -> int:
     # 域名模式不调 AI，不需要凭证
     if not AI_KEY and MODE not in ("domain",):
@@ -342,7 +435,9 @@ def main() -> int:
                 }
                 return { bar, folder: folder.id, ids };
             }""",
-            DOMAIN_SEEDS if MODE == "domain" else SEEDS,
+            DOMAIN_SEEDS if MODE == "domain"
+            else MOVEOUT_SEEDS if MODE == "folder-moveout"
+            else SEEDS,
         )
         print(f"已在「人工智能」下创建 {len(seeded['ids'])} 条书签\n")
 
@@ -351,6 +446,8 @@ def main() -> int:
 
         if MODE == "domain":
             return run_domain(page, seeded)
+        if MODE == "folder-moveout":
+            return run_folder_moveout(page, seeded)
         if MODE in ("folder", "folder-replan"):
             return run_folder(page, seeded)
 

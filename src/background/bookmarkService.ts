@@ -157,6 +157,32 @@ export async function resolveMergeGroup(
   return { ids: group.map((node) => node.id), names: group.map((node) => node.title) };
 }
 
+/**
+ * 某个目录相对于 rootId 的路径（`书签栏/工作` → `工作`）。
+ * 用于判断「哪些目录在这个文件夹内部」——路径前缀比对比逐层查父节点简单。
+ */
+export async function getFolderPathRelativeTo(
+  rootId: string,
+  folderId: string,
+): Promise<string | undefined> {
+  const nodes = await chrome.bookmarks
+    .getSubTree(rootId)
+    .catch(() => [] as chrome.bookmarks.BookmarkTreeNode[]);
+
+  let found: string | undefined;
+  const walk = (list: chrome.bookmarks.BookmarkTreeNode[] | undefined, parent: string): void => {
+    for (const node of list ?? []) {
+      if (node.url || !node.children) continue;
+      const path = parent ? `${parent}/${node.title}` : node.title;
+      if (node.id === folderId) found = path;
+      walk(node.children, path);
+    }
+  };
+  walk(nodes[0]?.children, '');
+
+  return found;
+}
+
 /** 某个目录（含所有子目录）下的全部书签 id */
 export async function collectSubtreeBookmarkIds(folderId: string): Promise<Set<string>> {
   const nodes = await chrome.bookmarks

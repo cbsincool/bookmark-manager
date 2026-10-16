@@ -599,6 +599,7 @@ function clusterOverflow(items: readonly OverflowItem[], maxDirs: number): strin
 export function mergeDirectoryTree(
   entries: readonly { path: string; ids: readonly string[] }[],
   unassignedIds: readonly string[],
+  unclassifiedPath: string = UNCLASSIFIED_DIR,
 ): Record<string, string[]> {
   const tree: Record<string, string[]> = {};
 
@@ -608,7 +609,7 @@ export function mergeDirectoryTree(
   }
 
   if (unassignedIds.length > 0) {
-    tree[UNCLASSIFIED_DIR] = [...(tree[UNCLASSIFIED_DIR] ?? []), ...unassignedIds];
+    tree[unclassifiedPath] = [...(tree[unclassifiedPath] ?? []), ...unassignedIds];
   }
 
   return tree;
