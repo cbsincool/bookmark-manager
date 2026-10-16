@@ -678,7 +678,16 @@ async function handleAIClassifyStart(
     skeletonRootId = folderId;
   } else if (movingOut && folderId) {
     // 移出时路径要相对书签栏，才能既指向文件夹内部的子目录、又指向外面的目标目录
-    const folderPath = (await getFolderPathRelativeTo(barId, folderId)) ?? '';
+    const folderPath = await getFolderPathRelativeTo(barId, folderId);
+    if (!folderPath) {
+      // 拿不到路径就没法给新目录加前缀，新目录会落到书签栏顶层、
+      // 原文件夹被搬空后又被 prune 删掉——看起来就像「文件夹被改名了」。
+      // 宁可响亮地失败，也不要静默把东西建到别处。
+      throw new Error(
+        '无法确定该文件夹在书签栏下的路径，已中止整理（避免把新目录建到书签栏顶层）。' +
+        '请先对书签栏执行一次索引重建后重试。',
+      );
+    }
     // 注意**不包含文件夹自己**：它的中心向量就是自己那批书签的均值，永远是最近匹配，
     // 移出因此永远不会发生。只留它的子目录 + 勾选的目标。
     const descendants = folderPath ? `${folderPath}/` : '';
@@ -1226,6 +1235,8 @@ async function handleOrganizeExecute(
   // 记录每个书签原本在哪个目录，整理结束后只清理这些被搬空的目录
   const parentOf = await buildParentMap();
   const emptied = new Set<string>();
+  // 实际用到的目录路径——「东西被建到哪儿去了」在界面上原本完全看不见
+  const paths: string[] = [];
 
   for (const [path, bookmarkIds] of Object.entries(directoryTree)) {
     if (existingPaths && !existingPaths.has(path)) {
@@ -1236,6 +1247,7 @@ async function handleOrganizeExecute(
     // Create folder path
     const pathParts = path.split('/');
     const folderId = await findOrCreateFolderPath(pathParts, rootId);
+    paths.push(path);
 
     // Move bookmarks to this folder
     for (const bookmarkId of bookmarkIds) {
@@ -1280,7 +1292,7 @@ async function handleOrganizeExecute(
   // 清理本次搬空的目录（不动用户自己留的空文件夹）
   const pruned = await pruneEmptiedFolders(emptied);
 
-  return { moved, inPlace, skipped, pruned, failed: failures.length, failures };
+  return { moved, inPlace, skipped, pruned, failed: failures.length, failures, paths };
 }
 
 /**
