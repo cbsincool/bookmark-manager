@@ -783,6 +783,44 @@ def main() -> int:
             [[merge_ids["a"], merge_ids["b"]]],
         )
 
+        # ---- 整理范围必须被尊重（域名聚类 + AI 合流的前提）----
+        # 曾经完全忽略 bookmarkIds：global 范围一律处理全部书签，于是向导里已经
+        # 按域名分好组的那部分又被 AI 重新分类，两棵树覆盖同一批书签、执行时互相抢，
+        # 域名目录可能最终是空的
+        print("\n" + "=" * 64)
+        print("⑫ 整理范围（bookmarkIds 必须被尊重）")
+        print("=" * 64)
+
+        subset = seeded["ids"][:7]
+        start = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": subset,
+                             "scope": "global", "mode": "fit"}, 60_000)
+        subset_task = (start.get("data") or {}).get("taskId") if start.get("success") else None
+        subset_tree = None
+
+        if not subset_task:
+            record("整理范围：启动", False, f"err={start.get('error', '')}")
+        else:
+            for _ in range(240):
+                panel.wait_for_timeout(2000)
+                task = (send(panel, {"type": "ORGANIZE_AI_CLASSIFY_POLL",
+                                     "taskId": subset_task}, 60_000).get("data") or {})
+                if task.get("status") == "completed":
+                    subset_tree = (task.get("result") or {}).get("directoryTree") or {}
+                    break
+                if task.get("status") == "failed":
+                    record("整理范围：完成", False, str(task.get("error"))[:160])
+                    break
+
+        if subset_tree is not None:
+            produced = {i for ids in subset_tree.values() for i in ids}
+            outside = produced - set(subset)
+            record("整理范围：只处理传入的书签，不越界", not outside,
+                   f"传入 {len(subset)} 条，产出 {len(produced)} 条"
+                   + (f"，越界 {len(outside)} 条" if outside else ""))
+            record("整理范围：传入的书签一条不漏",
+                   set(subset).issubset(produced),
+                   f"缺失 {len(set(subset) - produced)} 条")
+
         # ---- 还原 AI 设置（凭证不留在 profile 里）----
         if AI_KEY and prev_settings:
             send(panel, {"type": "UPDATE_SETTINGS", "settings": {

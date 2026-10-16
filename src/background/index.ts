@@ -628,10 +628,22 @@ async function handleAIClassifyStart(
     filtered = allBookmarks.filter((b) => !b.path.includes('[待删除_失效]'));
   }
 
-  // 不再跳过「已归类」的书签。整理本来就该可以重复跑：骨架取自现有目录，
-  // 归得对的书签移动是空操作，归错的才会被纠正。此前靠标记跳过，导致第二次
-  // 全局整理拿到空集合、预览一片空白却没有任何提示。
-  const bookmarks = filtered;
+  // 调用方指定的范围必须被尊重。
+  //
+  // 这里曾经完全忽略 bookmarkIds：global 范围一律处理全部书签（早期靠「已归类」
+  // 标记做过滤，也是同一个毛病）。后果是向导里已经按域名分好组、交给 AI 的那部分
+  // 书签也被重新分类，AI 树和域名树覆盖同一批书签，执行时互相抢——域名目录可能
+  // 最终是空的，取决于哪个先处理。
+  //
+  // 不再跳过「已归类」的书签（整理本来就该能重复跑），所以 bookmarkIds 是唯一
+  // 的范围来源。空数组表示不限定范围（文件夹范围走上面的分支）。
+  let bookmarks: BookmarkNode[];
+  if (scope !== 'folder' && bookmarkIds.length > 0) {
+    const requested = new Set(bookmarkIds);
+    bookmarks = filtered.filter((b) => requested.has(b.id));
+  } else {
+    bookmarks = filtered;
+  }
 
   processAIClassify(taskId, bookmarks, settings, mode, categories, mergedFolderNames).catch((err) => {
     console.error('[Organize] Task failed:', taskId, err);
@@ -1080,6 +1092,9 @@ async function handleOrganizeExecute(
       try {
         await moveBookmark(bookmarkId, folderId);
         if (sourceId) emptied.add(sourceId);
+        // 必须同步更新快照：后面处理另一个目录时还会查它。用移动前的旧位置判断
+        // 「是否已在目标目录」会得出错误结论，把该移动的书签当成已就位跳过
+        parentOf.set(bookmarkId, folderId);
         moved++;
       } catch (err) {
         // 失败必须带出来：service worker 的日志在界面上看不到，

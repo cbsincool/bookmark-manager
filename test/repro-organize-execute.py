@@ -26,6 +26,19 @@ AI_FORMAT = os.environ.get("BM_AI_FORMAT", "")
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "fit"
 
+# 域名模式用：5 个域名各 6 条，模拟「按域名建目录」
+DOMAIN_SEEDS = [
+    (f"{name} {i}", f"https://{host}/doc/{i}")
+    for host, name in [
+        ("react.dev", "React 文档"),
+        ("vuejs.org", "Vue 文档"),
+        ("kubernetes.io", "K8s 文档"),
+        ("docker.com", "Docker 文档"),
+        ("pytorch.org", "PyTorch 文档"),
+    ]
+    for i in range(6)
+]
+
 # 40 条，覆盖若干主题，模拟真实收藏夹
 SEEDS = [
     ("Transformer 架构详解", "https://example.com/transformer"),
@@ -96,8 +109,103 @@ def send(page, msg: dict, timeout: int = 120_000):
     )
 
 
+def run_domain(page, seeded) -> int:
+    """复现「按域名建目录」这条链路，严格照向导 handleDomainNext 的逻辑构造目录树。
+
+    只选前两个域名，其余交给 AI —— 这才是真实用法（全选会跳过 AI 那一段，
+    测不到两者合流时的问题）。
+    """
+    resp = send(page, {"type": "ORGANIZE_DOMAIN_CLUSTER"}, 120_000)
+    clusters = resp.get("data") or []
+    print(f"域名簇 {len(clusters)} 个:")
+    for c in clusters:
+        print(f"    {c['domain']}  {c['count']} 条  → 目录名 {c['suggestedFolderName']!r}")
+
+    selected = clusters[:2]
+    print(f"\n模拟用户只勾选前 {len(selected)} 个域名，其余交给 AI")
+
+    domain_tree: dict[str, list[str]] = {}
+    claimed: set[str] = set()
+    for c in selected:
+        name = c["suggestedFolderName"]
+        domain_tree[name] = [*domain_tree.get(name, []), *c["bookmarkIds"]]
+        claimed.update(c["bookmarkIds"])
+
+    all_ids = set(seeded["ids"])
+    remaining = sorted(all_ids - claimed)
+    print(f"域名树: {[(k, len(v)) for k, v in domain_tree.items()]}")
+    print(f"域名覆盖 {len(claimed)} 条，交给 AI {len(remaining)} 条")
+
+    # 照 handleDomainNext 的做法：AI 分类剩余书签，再把两棵树合并
+    if remaining and AI_KEY:
+        start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": remaining,
+                            "scope": "global", "mode": "fit"}, 60_000)
+        tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
+        if not tid:
+            print("AI 分类启动失败:", start.get("error"))
+            return 1
+        ai_tree = {}
+        for _ in range(240):
+            page.wait_for_timeout(2000)
+            task = (send(page, {"type": "ORGANIZE_AI_CLASSIFY_POLL", "taskId": tid}, 60_000)
+                    .get("data") or {})
+            if task.get("status") == "completed":
+                ai_tree = (task.get("result") or {}).get("directoryTree") or {}
+                break
+            if task.get("status") == "failed":
+                print("AI 分类失败:", task.get("error"))
+                return 1
+        print(f"AI 产出 {len(ai_tree)} 个目录: {[(k, len(v)) for k, v in ai_tree.items()]}")
+
+        merged = {k: list(v) for k, v in domain_tree.items()}
+        for path, ids in ai_tree.items():
+            merged[path] = [*merged.get(path, []), *ids]
+        tree = merged
+    else:
+        tree = domain_tree
+
+    print(f"\n最终目录树: {[(k, len(v)) for k, v in tree.items()]}")
+
+    exec_resp = send(page, {"type": "ORGANIZE_EXECUTE",
+                            "directoryTree": tree, "rootId": seeded["bar"]}, 300_000)
+    print(f"\n执行返回: success={exec_resp.get('success')} data={exec_resp.get('data')} "
+          f"err={exec_resp.get('error')}")
+
+    after = page.evaluate(
+        """async ([bar]) => {
+            const out = [];
+            const walk = async (id, path) => {
+                for (const c of await chrome.bookmarks.getChildren(id)) {
+                    if (c.url) continue;
+                    const p = path ? path + '/' + c.title : c.title;
+                    const kids = await chrome.bookmarks.getChildren(c.id);
+                    out.push({ path: p, bookmarks: kids.filter(k => k.url).length });
+                    await walk(c.id, p);
+                }
+            };
+            await walk(bar, '');
+            return out;
+        }""",
+        [seeded["bar"]],
+    )
+    print("\n执行后的书签栏结构:")
+    for row in after:
+        print(f"    {row['path']}  书签 {row['bookmarks']}")
+
+    page.evaluate(
+        """async ([bar]) => {
+            for (const c of await chrome.bookmarks.getChildren(bar)) {
+                try { await chrome.bookmarks.removeTree(c.id); } catch (e) {}
+            }
+        }""",
+        [seeded["bar"]],
+    )
+    return 0
+
+
 def main() -> int:
-    if not AI_KEY:
+    # 域名模式不调 AI，不需要凭证
+    if not AI_KEY and MODE != "domain":
         print("缺少 BM_AI_KEY")
         return 2
 
@@ -127,7 +235,9 @@ def main() -> int:
         # 配置 AI
         # 先关掉实时归档：否则每注入一条书签都会触发 onCreated → handleNewBookmark
         # → 调 AI 建目录并移动，把场景搅乱（实测会凭空多出三十来个空目录）
-        overrides = {"apiKey": AI_KEY, "realtimeArchiving": False}
+        overrides: dict = {"realtimeArchiving": False}
+        if AI_KEY:
+            overrides["apiKey"] = AI_KEY
         for key, val in [("apiEndpoint", AI_ENDPOINT), ("apiModel", AI_MODEL), ("apiFormat", AI_FORMAT)]:
             if val:
                 overrides[key] = val
@@ -145,12 +255,15 @@ def main() -> int:
                 }
                 return { bar, folder: folder.id, ids };
             }""",
-            SEEDS,
+            DOMAIN_SEEDS if MODE == "domain" else SEEDS,
         )
         print(f"已在「人工智能」下创建 {len(seeded['ids'])} 条书签\n")
 
         # 建索引
         send(page, {"type": "REBUILD_INDEX"}, 600_000)
+
+        if MODE == "domain":
+            return run_domain(page, seeded)
 
         # 整理
         start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
