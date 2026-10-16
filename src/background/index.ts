@@ -458,8 +458,12 @@ async function handleDomainCluster(): Promise<unknown> {
   const bookmarks = await getAllBookmarks();
   // Filter out bookmarks in [待删除_失效] folder
   const filteredBookmarks = bookmarks.filter((bm) => !bm.path.includes('[待删除_失效]'));
+  // 书签栏本身的标题：散在根下（没有归属目录）的书签 path 就等于它，
+  // 那种情况不算「已归位」
+  const tree = await chrome.bookmarks.getTree();
+  const rootPath = tree[0]?.children?.[0]?.title ?? '';
   // Return ALL domains (minCount=1) so user can choose which to use as directories
-  return buildDomainClusters(filteredBookmarks, 1);
+  return buildDomainClusters(filteredBookmarks, 1, rootPath);
 }
 
 async function handleSemanticCluster(

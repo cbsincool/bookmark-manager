@@ -85,6 +85,14 @@ export interface DomainCluster {
   readonly selected: boolean;
   /** 该域名下是否含「官网门户」页（根域名页 / index 页），供 UI 提示 */
   readonly hasPortal: boolean;
+  /**
+   * 该域名的书签若已**全部**位于「名字与 suggestedFolderName 对应」的目录下，
+   * 这里是那个目录路径。用于提示「这个域名已经归好位了，勾选它通常什么都不会变」。
+   *
+   * 注意不能只看「是否都堆在同一个目录里」——全塞在「杂项」这种大杂烩目录里
+   * 恰恰是最需要整理的情况，那种不算已归位。
+   */
+  readonly existingFolder?: string;
 }
 
 /**

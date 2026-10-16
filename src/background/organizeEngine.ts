@@ -45,6 +45,7 @@ export function isPortalUrl(url: string): boolean {
 export function buildDomainClusters(
   bookmarks: readonly BookmarkNode[],
   minCount: number,
+  rootPath = '',
 ): DomainCluster[] {
   const domainMap = new Map<string, BookmarkNode[]>();
 
@@ -67,8 +68,31 @@ export function buildDomainClusters(
       bookmarkIds: items.map((bm) => bm.id),
       suggestedFolderName: suggestFolderName(domain),
       hasPortal: items.some((bm) => isPortalUrl(bm.url)),
+      existingFolder: filedUnderFolder(items, rootPath, suggestFolderName(domain)),
       selected: false,
     }));
+}
+
+/**
+ * 该域名的书签若已全部收在「名字与目录名对应」的那个目录里，返回它的路径。
+ *
+ * 判据是「集中在**对应的**目录里」，不是「集中在同一个目录里」——
+ * 后者会把「全塞在『杂项』这种大杂烩目录」也算成已归位，而那恰恰最需要整理。
+ * 散在书签栏根下（rootPath）同样不算。
+ */
+function filedUnderFolder(
+  items: readonly BookmarkNode[],
+  rootPath: string,
+  folderName: string,
+): string | undefined {
+  const parents = new Set(items.map((bm) => bm.path));
+  if (parents.size !== 1) return undefined;
+
+  const [only] = parents;
+  if (!only || only === rootPath) return undefined;
+
+  const leaf = only.split('/').pop() ?? '';
+  return leaf.toLowerCase() === folderName.toLowerCase() ? only : undefined;
 }
 
 function suggestFolderName(domain: string): string {

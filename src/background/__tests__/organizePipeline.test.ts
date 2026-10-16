@@ -10,6 +10,7 @@ import {
 import type { SkeletonNode, OverflowItem } from '../organizeEngine';
 import type { BookmarkNode } from '@/shared/types';
 import { MAX_NEW_DIRS_CAP } from '@/shared/constants';
+import { buildDomainClusters } from '../organizeEngine';
 
 const vec = (...values: number[]): Float32Array => new Float32Array(values);
 
@@ -364,5 +365,75 @@ describe('mergeSkeletonByPath', () => {
 
     const ids = result.assigned.flatMap((b) => b.ids);
     expect(ids).toEqual([...new Set(ids)]);
+  });
+});
+
+describe('buildDomainClusters — existingFolder', () => {
+  const withPath = (id: string, url: string, path: string): BookmarkNode => ({
+    id, title: id, url, path,
+  });
+
+  it('reports the folder when every bookmark of a domain sits in the same one', () => {
+    // 用于在向导里标出「这个域名已经归好位了，不用再选」
+    const clusters = buildDomainClusters(
+      [
+        withPath('a', 'https://react.dev/1', '书签栏/React'),
+        withPath('b', 'https://react.dev/2', '书签栏/React'),
+      ],
+      1,
+      '书签栏',
+    );
+
+    expect(clusters[0].existingFolder).toBe('书签栏/React');
+  });
+
+  it('does not treat bookmarks loose in the bookmark bar as organized', () => {
+    // 散在书签栏根下正是需要整理的情况
+    const clusters = buildDomainClusters(
+      [withPath('a', 'https://react.dev/1', '书签栏'), withPath('b', 'https://react.dev/2', '书签栏')],
+      1,
+      '书签栏',
+    );
+
+    expect(clusters[0].existingFolder).toBeUndefined();
+  });
+
+  it('does not call a catch-all folder "organized" just because everything sits there', () => {
+    // 「全塞在同一个目录里」不等于已归位：全堆在「杂项」这种大杂烩目录里
+    // 恰恰最需要整理。判据必须是「收在**对应的**目录里」。
+    const clusters = buildDomainClusters(
+      [
+        withPath('a', 'https://react.dev/1', '书签栏/杂项'),
+        withPath('b', 'https://react.dev/2', '书签栏/杂项'),
+      ],
+      1,
+      '书签栏',
+    );
+
+    expect(clusters[0].suggestedFolderName).toBe('React');
+    expect(clusters[0].existingFolder).toBeUndefined();
+  });
+
+  it('matches a nested folder by its leaf name', () => {
+    const clusters = buildDomainClusters(
+      [withPath('a', 'https://react.dev/1', '书签栏/前端/React')],
+      1,
+      '书签栏',
+    );
+
+    expect(clusters[0].existingFolder).toBe('书签栏/前端/React');
+  });
+
+  it('does not report anything when the domain is spread across folders', () => {
+    const clusters = buildDomainClusters(
+      [
+        withPath('a', 'https://react.dev/1', '书签栏/React'),
+        withPath('b', 'https://react.dev/2', '书签栏/前端'),
+      ],
+      1,
+      '书签栏',
+    );
+
+    expect(clusters[0].existingFolder).toBeUndefined();
   });
 });

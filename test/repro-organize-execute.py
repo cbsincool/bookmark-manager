@@ -119,7 +119,8 @@ def run_domain(page, seeded) -> int:
     clusters = resp.get("data") or []
     print(f"域名簇 {len(clusters)} 个:")
     for c in clusters:
-        print(f"    {c['domain']}  {c['count']} 条  → 目录名 {c['suggestedFolderName']!r}")
+        mark = f"  [已归位: {c['existingFolder']}]" if c.get('existingFolder') else ''
+        print(f"    {c['domain']}  {c['count']} 条  → 目录名 {c['suggestedFolderName']!r}{mark}")
 
     selected = clusters[:2]
     print(f"\n模拟用户只勾选前 {len(selected)} 个域名，其余交给 AI")
