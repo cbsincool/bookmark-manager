@@ -100,10 +100,24 @@ export function resolveMessagesEndpoint(endpoint: string): string {
   return `${url}/v1/messages`;
 }
 
+export interface CallOptions {
+  /**
+   * 关掉推理模型的「思考」阶段（`thinking: { type: 'disabled' }`）。
+   *
+   * 对分类这种任务必须开：实测 deepseek-v4.1-flash 给 30 条书签分类时会「想」
+   * 1.6-2.7 万个字符，把 max_tokens 烧光后 **content 返回空串**（6 次里 5 次如此）。
+   * 关掉之后 completion 从 6129 tokens 降到 267，便宜 23 倍且不再截断。
+   *
+   * 这是非标准参数，别的服务商可能不认——调用方要准备好失败后不带它重试。
+   */
+  readonly disableThinking?: boolean;
+}
+
 export async function callCloudAPI(
   prompt: string,
   settings: Pick<AppSettings, 'apiEndpoint' | 'apiKey' | 'apiModel' | 'apiFormat'>,
   timeoutMs: number = 300000, // 5 minutes default timeout for large prompts
+  options?: CallOptions,
 ): Promise<string> {
   const format = settings.apiFormat ?? 'openai';
   const isAnthropic = format === 'anthropic';
@@ -143,6 +157,7 @@ export async function callCloudAPI(
         max_tokens: 8192,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
+        ...(options?.disableThinking ? { thinking: { type: 'disabled' } } : {}),
       });
 
   console.log('[API] Request body length:', body.length);

@@ -140,25 +140,57 @@ export async function classifyBookmarks(
   const known = new Set<string>(existingPaths);
   const created: string[] = [];
   let usedAi = false;
-  let lastDetail = '';
+  const failures: string[] = [];
+
+  /**
+   * 归档一批。失败时**对半拆开再试**。
+   *
+   * 推理模型有个间歇性毛病：有时把 `max_tokens` 全花在「思考」上，`content` 返回空串
+   * （实测约每几批一次）。整批失败意味着那批书签全部落进「未分类」——用户看到的是
+   * 「除了域名目录，其它全在未分类」。重试一次常常还不够，但**批越小需要的推理越少**，
+   * 所以拆半是有效的兜底。
+   */
+  async function classifyBatch(
+    batch: readonly ClassifyItem[],
+    depth = 0,
+  ): Promise<Record<string, string>> {
+    const prompt = buildBatchClassifyPrompt(batch, [...known], maxDepth, options?.mustUsePaths);
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        // 第一次关掉推理；它是非标准参数，万一服务商不认，第二次不带它重试
+        const raw = await callCloudAPI(prompt, settings, 300_000, {
+          disableThinking: attempt === 1,
+        });
+        const parsed = parseBatchClassifyResponse(raw, maxDepth);
+        if (Object.keys(parsed).length > 0) return parsed;
+
+        failures.push(
+          `批(${batch.length} 条)解析不出归属（返回 ${raw.length} 字符）` +
+            (raw.trim() ? `: ${raw.trim().slice(0, 120)}` : '：模型返回了空响应'),
+        );
+      } catch (err) {
+        failures.push(`批(${batch.length} 条): ${String(err).slice(0, 160)}`);
+        console.warn('[Classify] 请求失败:', err);
+      }
+    }
+
+    if (batch.length > 1 && depth < 3) {
+      const mid = Math.ceil(batch.length / 2);
+      const [left, right] = await Promise.all([
+        classifyBatch(batch.slice(0, mid), depth + 1),
+        classifyBatch(batch.slice(mid), depth + 1),
+      ]);
+      return { ...left, ...right };
+    }
+
+    return {};
+  }
 
   const batches = chunkItems(items, batchSize);
 
   for (const [index, batch] of batches.entries()) {
-    const prompt = buildBatchClassifyPrompt(batch, [...known], maxDepth, options?.mustUsePaths);
-    let parsed: Record<string, string> = {};
-
-    // 模型偶尔会回散文而不是 JSON，重试一次基本就好
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        parsed = parseBatchClassifyResponse(await callCloudAPI(prompt, settings), maxDepth);
-        if (Object.keys(parsed).length > 0) break;
-        lastDetail = `第 ${index + 1} 批解析不出任何归属`;
-      } catch (err) {
-        lastDetail = String(err).slice(0, 200);
-        console.warn(`[Classify] 第 ${index + 1} 批第 ${attempt} 次失败:`, err);
-      }
-    }
+    const parsed = await classifyBatch(batch);
 
     for (const item of batch) {
       const path = parsed[item.id];
@@ -178,6 +210,8 @@ export async function classifyBookmarks(
     assignments,
     createdPaths: created,
     usedAi,
-    detail: usedAi ? undefined : lastDetail,
+    // 只要有一批失败就带出来——那一批的书签会整批落进「未分类」，
+    // 而 usedAi 仍然是 true（其他批成功了），不报出来就完全看不见
+    detail: failures.length > 0 ? failures.join(' | ') : undefined,
   };
 }
