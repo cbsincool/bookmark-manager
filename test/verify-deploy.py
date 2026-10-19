@@ -888,6 +888,66 @@ def main() -> int:
                    bar_after == bar_before,
                    f"之前 {bar_before} → 之后 {bar_after}")
 
+        # ---- 小样本也必须走完整流程 ----
+        # 曾经有个「书签少于 4 条就直接全部丢进未分类」的门槛放在 processAIClassify
+        # 开头，于是 fit 模式下 2 条书签的文件夹整理后永远是「0 骨架目录 / 2 未分类」。
+        # 那个门槛只对「聚类」有意义，fit 模式的骨架来自现有目录、与样本量无关。
+        print("\n" + "=" * 64)
+        print("⑭ 小样本（< 4 条书签）")
+        print("=" * 64)
+
+        # 复刻用户的实际操作：2 条书签的文件夹 + 勾一个空的移出目标
+        tiny = panel.evaluate(
+            """async () => {
+                const bar = (await chrome.bookmarks.getTree())[0].children[0].id;
+                const f = await chrome.bookmarks.create({ parentId: bar, title: 'TINY_SEED' });
+                const target = await chrome.bookmarks.create({ parentId: bar, title: 'TINY_TARGET' });
+                const ids = [];
+                for (const [t, u] of [['本地服务 A', 'http://127.0.0.1:3000/a'],
+                                      ['本地服务 B', 'http://127.0.0.1:8080/b']]) {
+                    const bm = await chrome.bookmarks.create({ parentId: f.id, title: t, url: u });
+                    ids.push(bm.id);
+                }
+                return { folder: f.id, target: target.id, ids };
+            }"""
+        )
+
+        start = send(panel, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                             "scope": "folder", "folderId": tiny["folder"],
+                             "mode": "fit", "allowMoveOut": True,
+                             "moveOutTargets": ["TINY_TARGET"]}, 60_000)
+        tiny_task = (start.get("data") or {}).get("taskId") if start.get("success") else None
+        tiny_result = None
+
+        if not tiny_task:
+            record("小样本：启动", False, f"err={start.get('error', '')}")
+        else:
+            for _ in range(240):
+                panel.wait_for_timeout(2000)
+                task = (send(panel, {"type": "ORGANIZE_AI_CLASSIFY_POLL",
+                                     "taskId": tiny_task}, 60_000).get("data") or {})
+                if task.get("status") == "completed":
+                    tiny_result = task.get("result") or {}
+                    break
+                if task.get("status") == "failed":
+                    record("小样本：完成", False, str(task.get("error"))[:160])
+                    break
+
+        if tiny_result is not None:
+            tiny_stats = tiny_result.get("stats") or {}
+            tiny_tree = tiny_result.get("directoryTree") or {}
+            record("小样本：勾了移出目标就照常走完整流程（不再被「少于 4 条」拦住）",
+                   tiny_stats.get("skeletonCount", 0) > 0 and "TINY_TARGET" in tiny_tree,
+                   f"目录 {list(tiny_tree.keys())}，骨架 {tiny_stats.get('skeletonCount')}，"
+                   f"未分类 {tiny_stats.get('unassigned')}")
+
+        try:
+            panel.evaluate("""async ([ids]) => {
+                for (const id of ids) { try { await chrome.bookmarks.removeTree(id); } catch (e) {} }
+            }""", [tiny["folder"], tiny["target"]])
+        except Exception:  # noqa: BLE001
+            pass
+
         # ---- 还原 AI 设置（凭证不留在 profile 里）----
         if AI_KEY and prev_settings:
             send(panel, {"type": "UPDATE_SETTINGS", "settings": {

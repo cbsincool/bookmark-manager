@@ -21,6 +21,10 @@ PROFILE = str(Path(__file__).resolve().parent.parent / "chrome-ui-profile")
 AI_KEY = os.environ.get("BM_AI_KEY", "")
 AI_MODEL = os.environ.get("BM_AI_MODEL", "")
 MODE = sys.argv[1] if len(sys.argv) > 1 else "fit"
+# 书签条数：用户报告的场景是 2 条。这个数字很关键——
+# 曾经有个「少于 4 条就直接全部丢进未分类」的门槛放在函数开头，
+# 我之前的测试数据一直是 5 条和 40 条，永远撞不到它。
+SEED_COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 
 
 def send(page, msg: dict, timeout: int = 120_000):
@@ -84,7 +88,7 @@ def main() -> int:
 
         # 造数据：127.0.0.1 有 5 条，localhost 是空的
         seeded = panel.evaluate(
-            """async () => {
+            """async ([limit]) => {
                 const bar = (await chrome.bookmarks.getTree())[0].children[0].id;
                 const src = await chrome.bookmarks.create({ parentId: bar, title: '127.0.0.1' });
                 const dst = await chrome.bookmarks.create({ parentId: bar, title: 'localhost' });
@@ -94,11 +98,12 @@ def main() -> int:
                     ['前端热更新说明', 'http://127.0.0.1:5173/guide'],
                     ['本地数据库连接', 'http://127.0.0.1:5432/notes'],
                     ['开发环境搭建', 'http://127.0.0.1:3000/setup'],
-                ]) {
+                ].slice(0, limit)) {
                     await chrome.bookmarks.create({ parentId: src.id, title, url });
                 }
                 return { bar, src: src.id, dst: dst.id };
-            }"""
+            }""",
+            [SEED_COUNT],
         )
         print(f"已建：「127.0.0.1」5 条 / 空目录「localhost」\n")
 

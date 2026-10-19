@@ -945,12 +945,6 @@ async function processAIClassify(
 
     const titleById = new Map(bookmarks.map((b) => [b.id, b.title]));
 
-    // 书签太少，聚类没有意义
-    if (vectors.length < 4) {
-      finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
-      return;
-    }
-
     const canUseAI = Boolean(
       settings.apiEndpoint && (settings.apiFormat === 'anthropic' || settings.apiKey),
     );
@@ -1028,6 +1022,16 @@ async function processAIClassify(
     let namingDetail: string | undefined;
 
     if (skeleton.length === 0) {
+      // 书签太少，聚类没有意义。
+      // ⚠️ 这个门槛**只能放在聚类分支里**：它曾经放在函数开头，于是 fit 模式
+      // 下只要书签数 < 4 就直接全部丢进「未分类」并返回——骨架、归位、移出
+      // 一行都没跑。实测 2 条书签的文件夹整理后永远是「0 骨架目录 / 2 未分类」，
+      // 而 fit 模式的骨架来自现有目录，跟样本量根本无关。
+      if (vectors.length < 4) {
+        finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
+        return;
+      }
+
       // 分层聚类：按「目标每目录条数」反推簇数，并在大类内再细分一层。
       // 单层 K-means 只能靠书签总数猜粒度，1643 条书签给 18 个目录、每目录 91 条，
       // 等于没整理。organizeMaxDepth=1 时用户明确不要层级，就不细分。
