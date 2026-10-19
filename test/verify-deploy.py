@@ -418,7 +418,9 @@ def main() -> int:
                 record("整理流水线：目录名不中英混排", not mixed,
                        f"违规: {mixed[:5]}" if mixed else "")
 
-                member_ids = [i for ids in tree.values() for i in ids]
+                # 「未分类」桶本身就是 stats.unassigned 那批，不能再算进成员，否则重复计数
+                member_ids = [i for p, ids in tree.items()
+                              if p not in ("未分类", "Unclassified") for i in ids]
                 unassigned = stats.get("unassigned", 0)
                 record("整理流水线：每条书签恰好归属一次",
                        len(member_ids) == len(set(member_ids))

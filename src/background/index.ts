@@ -2,14 +2,13 @@ import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, 
 import { generateEmbedding, generateEmbeddingsBatch } from './embeddingClient';
 import { rerank } from './rerankerClient';
 import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2Content, scoreL3, buildDedupGroups } from './dedupEngine';
-import { buildDomainClusters, computeDirectoryCohesion, computeDirectoryVector, buildSemanticClusters, assignToSkeleton, groupOverflow, mergeDirectoryTree, buildSkeletonFromFolders, averageVectors, buildHierarchicalClusters, mergeSkeletonByPath } from './organizeEngine';
-import type { SkeletonNode, OverflowItem, SemanticCluster, OverflowGroup, HierarchicalCluster } from './organizeEngine';
-import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse, buildClusterNamingPrompt, buildHierarchicalNamingPrompt, parseClusterNamingResponse } from './apiClient';
+import { buildDomainClusters, computeDirectoryVector, buildSemanticClusters, mergeDirectoryTree } from './organizeEngine';
+import { classifyBookmarks } from './aiClassifier';
+import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse } from './apiClient';
 import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
 import { cosineSimilarity } from '@/shared/vectorSearch';
-import { suggestDirectoryName, normalizeDirectoryPath } from '@/shared/directoryNaming';
-import { DEFAULT_SETTINGS, BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, LEGACY_DEFAULT_CATEGORIES, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS, MAX_SUB_CLUSTERS } from '@/shared/constants';
+import { DEFAULT_SETTINGS, BATCH_SIZE, MAX_BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, LEGACY_DEFAULT_CATEGORIES, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS } from '@/shared/constants';
 import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats, OrganizeMode } from '@/shared/types';
 import type { MessageRequest, MessageResponse, AsyncTask } from '@/shared/messageTypes';
 
@@ -736,133 +735,50 @@ interface NamingOutcome {
 }
 
 /**
- * 把分层聚类落成目录骨架。
+ * 给批次排序：用 k-means 把相似的书签聚到一起，再按簇输出。
  *
- * 层级由代码拼：大类名 + 子类名 → `大类/子类`。模型只负责给每一段起名字，
- * 不需要理解「这几个子类属于同一个大类」，所以层级不会被它搞乱。
+ * 这里用 k-means **只是为了让相邻的书签相似**——第一批新建的目录会成为后续批次的
+ * 「已有目录」，同主题挨着处理才会收敛到一套目录上，而不是每批各建一套。
+ * **归属判断仍然全交给 AI**：k-means 找得出「向量团块」，找不出「语义类别」。
  */
-function buildHierarchicalSkeleton(
-  groups: readonly HierarchicalCluster[],
-  names: Readonly<Record<string, string>>,
-  vectorMap: ReadonlyMap<string, Float32Array>,
-): SkeletonNode[] {
-  const nodes: SkeletonNode[] = [];
+function orderForBatching(
+  vectors: readonly { id: string; vector: Float32Array }[],
+  bookmarks: readonly BookmarkNode[],
+): BookmarkNode[] {
+  const fallback = [...bookmarks];
+  if (vectors.length === 0) return fallback;
 
-  groups.forEach((group, i) => {
-    const topName = names[String(i)] || group.top.topicName || `分类${i + 1}`;
+  const k = Math.max(2, Math.min(30, Math.round(vectors.length / MAX_BATCH_SIZE)));
+  const clusters = buildSemanticClusters(vectors, fallback, k, { minClusterSize: 1 });
+  if (clusters.length === 0) return fallback;
 
-    if (group.children.length === 0) {
-      nodes.push({
-        path: topName,
-        memberIds: group.top.bookmarkIds,
-        centroid: group.top.centroid,
-        isOverflow: false,
-      });
-      return;
-    }
-
-    group.children.forEach((child, j) => {
-      const subName = names[`${i}.${j}`] || child.topicName || `子类${j + 1}`;
-      // 走一遍归一化：降级命名时父子可能拿到同一个词（「文档/文档」），
-      // normalizeDirectoryPath 会折叠连续重复段
-      nodes.push({
-        path: normalizeDirectoryPath(`${topName}/${subName}`),
-        memberIds: child.bookmarkIds,
-        centroid: child.centroid,
-        isOverflow: false,
-      });
-    });
-  });
-
-  return nodes;
-}
-
-/** 给分层聚类命名。与 nameClusters 同构，只是输入输出带上了层级 */
-async function nameHierarchical(
-  groups: readonly HierarchicalCluster[],
-  titleById: ReadonlyMap<string, string>,
-  settings: AppSettings,
-  canUseAI: boolean,
-  userCategories: readonly string[] | undefined,
-): Promise<NamingOutcome> {
-  const fallback: Record<string, string> = {};
-  groups.forEach((group, i) => {
-    fallback[String(i)] = group.top.topicName;
-    group.children.forEach((child, j) => {
-      fallback[`${i}.${j}`] = child.topicName;
-    });
-  });
-
-  if (!canUseAI) return { paths: fallback, usedAi: false, detail: '未配置可用的模型' };
-
-  const titlesOf = (ids: readonly string[]): string[] =>
-    ids.slice(0, 8).map((id) => titleById.get(id) ?? '').filter(Boolean);
-
-  const input = groups.map((group, i) => ({
-    groupId: String(i),
-    titles: titlesOf(group.top.bookmarkIds),
-    children: group.children.map((child, j) => ({
-      id: `${i}.${j}`,
-      titles: titlesOf(child.bookmarkIds),
-    })),
-  }));
-
-  const prompt = buildHierarchicalNamingPrompt(input, userCategories);
-  const ATTEMPTS = 2;
-  let lastDetail = '';
-
-  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-    try {
-      const raw = await callCloudAPI(prompt, settings);
-      const parsed = parseClusterNamingResponse(raw);
-      // 至少要有一个大类被命名，否则整份输出都是废的
-      const covered = groups.filter((_, i) => parsed[String(i)]).length;
-      if (covered > 0) {
-        return { paths: { ...fallback, ...parsed }, usedAi: true };
+  const byId = new Map(bookmarks.map((b) => [b.id, b]));
+  const ordered: BookmarkNode[] = [];
+  const seen = new Set<string>();
+  for (const cluster of clusters) {
+    for (const id of cluster.bookmarkIds) {
+      const bm = byId.get(id);
+      if (bm && !seen.has(id)) {
+        seen.add(id);
+        ordered.push(bm);
       }
-      lastDetail = `模型输出解析不出任何大类（${raw.length} 字符）: ${raw.trim().slice(0, 150)}`;
-    } catch (err) {
-      console.warn(`[Organize] 分层命名第 ${attempt} 次失败:`, err);
-      lastDetail = String(err).slice(0, 300);
     }
   }
-
-  console.warn('[Organize] 分层命名失败，退回关键词命名:', lastDetail);
-  return { paths: fallback, usedAi: false, detail: lastDetail };
-}
-
-/** 给溢出新建的目录命名。它们是平级目录，所以深度固定为 1 */
-async function nameOverflowGroups(
-  groups: readonly OverflowGroup[],
-  settings: AppSettings,
-  canUseAI: boolean,
-): Promise<string[]> {
-  const fallback = groups.map((group) => suggestDirectoryName(group.titles));
-  if (!canUseAI || groups.length === 0) return fallback;
-
-  try {
-    const clusterInput = groups.map((group, i) => ({
-      clusterId: String(i),
-      titles: group.titles.slice(0, 12),
-    }));
-    const raw = await callCloudAPI(buildClusterNamingPrompt(clusterInput, 1), settings);
-    // 强制 1 层：模型偶尔会无视 prompt 里的深度约束，回出 "户外/露营" 这种两层路径
-    const parsed = parseClusterNamingResponse(raw, 1);
-    return groups.map((_, i) => parsed[String(i)] || fallback[i]);
-  } catch (err) {
-    console.warn('[Organize] 溢出目录命名失败，退回关键词命名:', err);
-    return fallback;
-  }
+  // 没被聚到的（维度不一致等）补在后面，保证一条不漏
+  for (const bm of bookmarks) if (!seen.has(bm.id)) ordered.push(bm);
+  return ordered;
 }
 
 /**
- * 整理流程：定骨架 → 逐条归位 → 溢出成组 → 汇合。
+ * 整理流程：确定初始目录集合 → 分批交给 AI 归档 → 汇合。
  *
- * 骨架来源由 mode 决定：
- *   fit    —— 现有目录结构。归得对的书签移动是空操作，归错的才会被移走，
- *             所以可以反复整理而不会来回搬动。
- *   replan —— 分层聚类重新生成（先分大类，再在大类内细分一层）。
- * 无论哪种，每条书签的最终归属都由它自己的向量与各目录中心的余弦决定。
+ * 归属判断**整个交给模型**。向量只用来给批次排序（把相似的书签排在一起处理），
+ * 不用来判断归属——实测在真实书签上，相关与不相关内容的余弦相似度都落在 0.4-0.6，
+ * 区分不出来；k-means 找得出「向量团块」，找不出「语义类别」。
+ *
+ * mode 只决定**起点**：
+ *   fit    —— 初始目录集合 = 现有目录（归得对的会被模型判回原处，移动是空操作）
+ *   replan —— 初始目录集合 = 空（目录随内容生长）
  */
 async function processAIClassify(
   taskId: string,
@@ -949,266 +865,85 @@ async function processAIClassify(
       settings.apiEndpoint && (settings.apiFormat === 'anthropic' || settings.apiKey),
     );
 
-    // --- 阶段 1：定骨架 ---
-    // fit（默认）：骨架取自**现有目录结构**。归得对的书签自然匹配到自己所在的目录，
-    //   移动变成空操作；归错的才会匹配到别处从而被移走。「正确的不动、错误的被纠正」
-    //   由此结构性成立，不靠任何「已归类」记账，重复整理也就安全了。
-    // replan：每次重新聚类生成骨架，目录结构会重构（推倒重来的场景）。
-    let skeleton: SkeletonNode[] = [];
-    // 骨架是否真的来自现有目录。聚类生成的骨架里 memberIds 是「簇成员」而非
-    // 「已在该目录里」，不能拿来做「无需移动」的判断
-    let skeletonFromFolders = false;
+    // --- 阶段 1：确定初始目录集合 ---
+    //
+    // 归属判断整个交给 AI。向量只用来**给批次排序**（把相似的书签排在一起处理），
+    // 不用来判断归属——实测在真实书签上，相关与不相关内容的余弦相似度都落在
+    // 0.4-0.6，区分不出来（显卡扩展坞评测和智能体文档的相似度，跟同主题内容差不多）。
+    const rootFolderId = skeletonRootId ?? (await getRootFolderId());
+    const allFolders = await getExistingFolders(rootFolderId);
 
-    // 「移出到目标」和「重新规划结构」是互斥的：重新规划会在文件夹内部造出新的
-    // 子目录，而那些子目录一定匹配得上（书签就是它们的簇成员），移出永远不会发生。
-    // 所以勾了移出目标就按「现有目录」处理——没有子目录时，全部去目标。
-    const effectiveMode: OrganizeMode = forceIncludePaths.length > 0 ? 'fit' : mode;
-
-    if (effectiveMode === 'fit') {
-      const rootFolderId = skeletonRootId ?? (await getRootFolderId());
-      const folders = (await getExistingFolders(rootFolderId)).filter(
-        (f) => !keepSkeletonPath || keepSkeletonPath(f.path),
-      );
-      // 用户勾选的移出目标即使为空也要纳入骨架（否则它永远收不到书签）
-      const forced = new Set(forceIncludePaths);
-      const usable = folders.filter(
-        (f) =>
-          (f.bookmarkIds.length > 0 || forced.has(f.path)) &&
-          f.path !== UNCLASSIFIED_DIR &&
-          !f.path.includes('[待删除_失效]'),
-      );
-      updateProgress(0, usable.length, `读取现有目录 (${usable.length} 个)`);
-
-      // 骨架目录里的书签**必须**有向量，否则 buildSkeletonFromFolders 会把该目录
-      // 整个跳过——于是「哪些目录参与归位」取决于哪些书签碰巧建过索引，很任意。
-      // 移出目标这种刚建、或从没跑过索引重建的目录会因此永远收不到书签。
-      const skeletonIds = usable.flatMap((f) => f.bookmarkIds);
-      const missingVectors = skeletonIds.filter((id) => !vectorMap.has(id));
-      if (missingVectors.length > 0) {
-        const all = await getAllBookmarks();
-        const textById = new Map(all.map((b) => [b.id, `${b.title} ${b.url}`]));
-        updateProgress(0, missingVectors.length, `补齐目录向量 (0/${missingVectors.length})`);
-
-        for (let i = 0; i < missingVectors.length; i += BATCH_SIZE) {
-          const batch = missingVectors.slice(i, i + BATCH_SIZE);
-          const texts = batch.map((id) => textById.get(id) ?? '');
-          const vectors = await generateEmbeddingsBatch(texts);
-          for (let j = 0; j < batch.length; j++) {
-            vectorMap.set(batch[j], vectors[j]);
-            await db.putVector({
-              id: batch[j], vector: vectors[j], text: texts[j], updatedAt: Date.now(),
-            });
-          }
-        }
-      }
-
-      // 空目录用目录名的向量兜底
-      const emptyFolders = usable.filter(
-        (f) => !f.bookmarkIds.some((id) => vectorMap.has(id)),
-      );
-      const nameVectors = new Map<string, Float32Array>();
-      if (emptyFolders.length > 0) {
-        const names = emptyFolders.map((f) => f.path.split('/').pop() ?? f.path);
-        const vectors = await generateEmbeddingsBatch(names);
-        emptyFolders.forEach((f, i) => nameVectors.set(f.path, vectors[i]));
-      }
-
-      skeleton = buildSkeletonFromFolders(usable, vectorMap, nameVectors);
-      skeletonFromFolders = skeleton.length > 0;
-    }
-
-    // 没有可用目录（首次整理）或用户选择重新规划 → 退回聚类生成骨架
-    let namedWithAi: boolean | null = null;
-    let namingDetail: string | undefined;
-
-    if (skeleton.length === 0) {
-      // 书签太少，聚类没有意义。
-      // ⚠️ 这个门槛**只能放在聚类分支里**：它曾经放在函数开头，于是 fit 模式
-      // 下只要书签数 < 4 就直接全部丢进「未分类」并返回——骨架、归位、移出
-      // 一行都没跑。实测 2 条书签的文件夹整理后永远是「0 骨架目录 / 2 未分类」，
-      // 而 fit 模式的骨架来自现有目录，跟样本量根本无关。
-      if (vectors.length < 4) {
-        finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
-        return;
-      }
-
-      // 分层聚类：按「目标每目录条数」反推簇数，并在大类内再细分一层。
-      // 单层 K-means 只能靠书签总数猜粒度，1643 条书签给 18 个目录、每目录 91 条，
-      // 等于没整理。organizeMaxDepth=1 时用户明确不要层级，就不细分。
-      const maxSub = (settings.organizeMaxDepth ?? 3) >= 2 ? MAX_SUB_CLUSTERS : 0;
-      updateProgress(0, total, '语义聚类中');
-      const groups = buildHierarchicalClusters(vectors, [...bookmarks], { maxSub });
-
-      if (groups.length === 0) {
-        finish({ [UNCLASSIFIED_DIR]: bookmarks.map((b) => b.id) }, [], [], statsFor({}));
-        return;
-      }
-
-      const leafCount = groups.reduce((n, g) => n + Math.max(1, g.children.length), 0);
-      updateProgress(0, groups.length, `AI 命名中 (${groups.length} 个大类 / ${leafCount} 个目录)`);
-      const naming = await nameHierarchical(groups, titleById, settings, canUseAI, userCategories);
-      updateProgress(groups.length, groups.length, 'AI 命名完成');
-      namedWithAi = naming.usedAi;
-      namingDetail = naming.detail;
-
-      skeleton = buildHierarchicalSkeleton(groups, naming.paths, vectorMap).map((node) => ({
-        ...node,
-        path: newDirPrefix ? `${newDirPrefix}${node.path}` : node.path,
-      }));
-
-      // 「只使用已有目录」时，骨架里不存在于书签树的目录一律不建。
-      // 必须用 getDirectoryPathsUnder（相对书签栏）——findOrCreateFolderPath 的基准
-      // 就是书签栏，用从书签树根开始走的路径会多一层前缀，永远匹配不上。
-      if (settings.onlyUseExistingDirectories) {
-        const existing = new Set(await getDirectoryPathsUnder(await getRootFolderId()));
-        skeleton = skeleton.filter((node) => existing.has(node.path));
+    const initialPaths: string[] = [];
+    if (mode === 'fit') {
+      for (const folder of allFolders) {
+        if (folder.path === UNCLASSIFIED_DIR) continue;
+        if (folder.path.includes('[待删除_失效]')) continue;
+        if (keepSkeletonPath && !keepSkeletonPath(folder.path)) continue;
+        initialPaths.push(folder.path);
       }
     }
-
-    // 勾选的移出目标必须**无论哪种模式**都在骨架里。
-    // replan 模式的骨架是重新聚类出来的，目标目录不在里面——不补进去的话
-    // 「允许移出」在那个模式下完全失效，书签会被细分在文件夹内部。
-    // （fit 模式下目标已在骨架里，mergeSkeletonByPath 会把重复的合掉。）
-    if (forceIncludePaths.length > 0) {
-      const rootFolderId = skeletonRootId ?? (await getRootFolderId());
-      const allFolders = await getExistingFolders(rootFolderId);
-      const targetFolders = allFolders.filter((f) => forceIncludePaths.includes(f.path));
-
-      const emptyTargets = targetFolders.filter(
-        (f) => !f.bookmarkIds.some((id) => vectorMap.has(id)),
-      );
-      const targetNameVectors = new Map<string, Float32Array>();
-      if (emptyTargets.length > 0) {
-        const names = emptyTargets.map((f) => f.path.split('/').pop() ?? f.path);
-        const vectors = await generateEmbeddingsBatch(names);
-        emptyTargets.forEach((f, i) => targetNameVectors.set(f.path, vectors[i]));
-      }
-
-      skeleton = [
-        ...skeleton,
-        ...buildSkeletonFromFolders(targetFolders, vectorMap, targetNameVectors),
-      ];
+    // 用户勾选的移出目标始终可选
+    for (const target of forceIncludePaths) {
+      if (target && !initialPaths.includes(target)) initialPaths.push(target);
     }
 
-    // 路径重复会让 bucketize 产出重复的桶（同一批书签被写进多个目录）
-    skeleton = mergeSkeletonByPath(skeleton);
+    // --- 阶段 2：分批交给 AI 归档 ---
+    updateProgress(0, total, 'AI 归档中');
+    const maxDepth = settings.organizeMaxDepth ?? 3;
+    const ordered = orderForBatching(vectors, [...bookmarks]);
 
-    // --- 阶段 2：逐条归位 ---
-    updateProgress(0, total, `归位中 (0/${total})`);
-    const assignment = assignToSkeleton(vectors, skeleton, ASSIGN_ACCEPT_THRESHOLD);
-    updateProgress(total, total, '归位完成');
+    const outcome = canUseAI
+      ? await classifyBookmarks(
+          ordered.map((b) => ({ id: b.id, title: b.title, url: b.url })),
+          initialPaths,
+          settings,
+          {
+            batchSize: MAX_BATCH_SIZE,
+            maxDepth,
+            mustUsePaths: forceIncludePaths,
+            onProgress: (done, count) => updateProgress(done, count, `AI 归档中 (${done}/${count})`),
+          },
+        )
+      : {
+          assignments: new Map<string, string>(),
+          createdPaths: [] as string[],
+          usedAi: false,
+          detail: '未配置可用的模型',
+        };
 
-    // fit 模式下，骨架的成员就是各目录现有的书签。若每条书签都已经在它该去的
-    // 目录里，整理结果就是「原地不动」——这在书签全挤在一个文件夹时必然发生，
-    // 而界面上看不出任何变化，用户只会以为功能坏了。明确报出来。
-    let needMove = Number.POSITIVE_INFINITY;
-    if (skeletonFromFolders) {
-      const alreadyHome = assignment.assigned.reduce((sum, bucket) => {
-        const node = skeleton.find((s) => s.path === bucket.path);
-        const own = new Set(node?.memberIds ?? []);
-        return sum + bucket.ids.filter((id) => own.has(id)).length;
-      }, 0);
-      needMove =
-        assignment.assigned.reduce((sum, b) => sum + b.ids.length, 0) -
-        alreadyHome +
-        assignment.overflowIds.length;
+    // --- 阶段 3：汇合 ---
+    const createdSet = new Set(outcome.createdPaths);
+    const byPath = new Map<string, string[]>();
+    for (const [id, rawPath] of outcome.assignments) {
+      // 文件夹整理且允许移出时，路径是相对书签栏的；新目录要建在该文件夹内部
+      const path = createdSet.has(rawPath) && newDirPrefix ? `${newDirPrefix}${rawPath}` : rawPath;
+      byPath.set(path, [...(byPath.get(path) ?? []), id]);
     }
 
-    // 勾了移出目标时，与所有目录都不匹配的书签**直接就近移入目标**。
-    // 目标是人手挑的，再卡相似度阈值只会让「我明明勾了它」变成「什么都没发生」。
-    let assignedBuckets = [...assignment.assigned];
-    let overflowIds = [...assignment.overflowIds];
-
-    const targetNodes = skeleton.filter((n) => forceIncludePaths.includes(n.path));
-    if (targetNodes.length > 0 && overflowIds.length > 0) {
-      const byPath = new Map(assignedBuckets.map((b) => [b.path, [...b.ids]]));
-      const rest: string[] = [];
-
-      for (const id of overflowIds) {
-        const vector = vectorMap.get(id);
-        if (!vector) {
-          rest.push(id);
-          continue;
-        }
-        let best = targetNodes[0];
-        let bestSim = -Infinity;
-        for (const node of targetNodes) {
-          const sim = cosineSimilarity(vector, node.centroid);
-          if (sim > bestSim) {
-            bestSim = sim;
-            best = node;
-          }
-        }
-        byPath.set(best.path, [...(byPath.get(best.path) ?? []), id]);
-      }
-
-      assignedBuckets = Array.from(byPath.entries()).map(([path, ids]) => ({ path, ids }));
-      overflowIds = rest;
-    }
-
-    // --- 阶段 3：溢出成组 ---
-    let overflowEntries: { path: string; ids: string[] }[] = [];
-    let unassignedIds = [...overflowIds];
-
-    if (overflowIds.length > 0 && !settings.onlyUseExistingDirectories) {
-      updateProgress(0, overflowIds.length, `处理 ${overflowIds.length} 条未归位书签`);
-
-      const overflowItems: OverflowItem[] = overflowIds
-        .map((id) => {
-          const vector = vectorMap.get(id);
-          const bookmark = bookmarks.find((b) => b.id === id);
-          if (!vector || !bookmark) return null;
-          return { id, vector, title: bookmark.title };
-        })
-        .filter((item): item is OverflowItem => item !== null);
-
-      const overflow = groupOverflow(overflowItems);
-      const names = await nameOverflowGroups(overflow.groups, settings, canUseAI);
-
-      overflowEntries = overflow.groups.map((group, i) => ({
-        path: newDirPrefix ? `${newDirPrefix}${names[i]}` : names[i],
-        ids: [...group.ids],
-      }));
-      unassignedIds = [...overflow.unassignedIds];
-    }
-
-    // --- 阶段 4：汇合 ---
-    const assignedIds = new Set(assignedBuckets.flatMap((b) => b.ids));
-    const accounted = new Set([...assignedIds, ...unassignedIds]);
-    // 没有向量、因而没参与归位的书签，一并落进未分类——保证 Σ成员 + 未分类 === 总数
-    unassignedIds = [...unassignedIds, ...bookmarks.filter((b) => !accounted.has(b.id)).map((b) => b.id)];
+    const assignedIds = new Set(outcome.assignments.keys());
+    const unassignedIds = bookmarks.filter((b) => !assignedIds.has(b.id)).map((b) => b.id);
 
     const directoryTree = mergeDirectoryTree(
-      [...assignedBuckets.map((b) => ({ path: b.path, ids: [...b.ids] })), ...overflowEntries],
+      Array.from(byPath.entries()).map(([path, ids]) => ({ path, ids })),
       unassignedIds,
       newDirPrefix ? `${newDirPrefix}${UNCLASSIFIED_DIR}` : UNCLASSIFIED_DIR,
     );
 
     const stats = statsFor({
-      skeletonCount: skeleton.length,
+      skeletonCount: initialPaths.length,
       assigned: assignedIds.size,
-      overflow: overflowIds.length,
-      overflowDirectories: overflowEntries.length,
+      overflow: 0,
+      overflowDirectories: outcome.createdPaths.length,
       unassigned: unassignedIds.length,
-      warning:
-        (needMove === 0 ? 'nothing-to-do' : undefined) ??
-        assignment.warning ??
-        (namedWithAi === null
-          ? undefined
-          : namedWithAi
-            ? undefined
-            : canUseAI
-              ? 'ai-naming-failed'
-              : 'ai-unavailable'),
-      warningDetail: namingDetail,
+      warning: outcome.usedAi
+        ? undefined
+        : canUseAI
+          ? 'ai-naming-failed'
+          : 'ai-unavailable',
+      warningDetail: outcome.detail,
     });
 
-    finish(
-      directoryTree,
-      skeleton.map((node) => node.path),
-      overflowEntries.map((entry) => entry.path),
-      stats,
-    );
+    finish(directoryTree, initialPaths, outcome.createdPaths, stats);
   } catch (err) {
     task.status = 'failed';
     task.error = String(err);

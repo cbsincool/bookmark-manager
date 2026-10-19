@@ -91,6 +91,22 @@ SEEDS = [
 # 什么都能匹配上，书签根本没有「明显不匹配」的机会。
 MOVEOUT_SEEDS = SEEDS[:20] + SEEDS[37:]
 
+# 大规模模式用：20 个主题 × 10 条 = 200 条，量级接近用户真实书签库。
+# 用户报「新建了目录但没放网页、书签挤在个别目录里」，怀疑与规模有关——
+# 簇数随书签数增长，而我之前只在小样本（40 条以内）上验证过。
+SCALE_TOPICS = [
+    '智能体', 'RAG检索', '向量数据库', '大模型微调', '提示词工程',
+    '前端框架', 'React生态', 'Vue生态', '构建工具', 'CSS布局',
+    '容器编排', 'K8s运维', 'CICD流水线', '监控告警', '数据库',
+    'Python', 'Rust', 'Go语言', '个人理财', '健康运动',
+]
+SCALE_SUFFIX = ['入门', '进阶', '实战', '原理', '最佳实践', '常见问题', '性能优化', '对比选型', '踩坑记录', '速查手册']
+SCALE_SEEDS = [
+    (f'{topic} {suffix}', f'https://example.com/{i}/{j}')
+    for i, topic in enumerate(SCALE_TOPICS)
+    for j, suffix in enumerate(SCALE_SUFFIX)
+]
+
 
 def send(page, msg: dict, timeout: int = 120_000):
     return page.evaluate(
@@ -471,9 +487,92 @@ def run_moveout_empty(page) -> int:
     return 0
 
 
+def run_scale(page, seeded) -> int:
+    """大规模 replan：检查目录分布是否合理。
+
+    用户报「新建了目录但没放网页，书签挤在个别目录里」。怀疑与规模有关——
+    簇数随书签数增长（n=1643 时一级 17 个、叶子 100+），而我之前只在小样本上验证过。
+    """
+    start = send(page, {"type": "ORGANIZE_AI_CLASSIFY_START", "bookmarkIds": [],
+                        "scope": "global", "mode": "replan"}, 60_000)
+    tid = (start.get("data") or {}).get("taskId") if start.get("success") else None
+    if not tid:
+        print("启动失败:", start.get("error"))
+        return 1
+
+    tree = None
+    for _ in range(300):
+        page.wait_for_timeout(2000)
+        task = (send(page, {"type": "ORGANIZE_AI_CLASSIFY_POLL", "taskId": tid}, 60_000)
+                .get("data") or {})
+        if task.get("status") == "completed":
+            tree = (task.get("result") or {}).get("directoryTree") or {}
+            break
+        if task.get("status") == "failed":
+            print("分类失败:", task.get("error"))
+            return 1
+
+    if tree is None:
+        print("分类超时")
+        return 1
+
+    sizes = sorted(((len(v), k) for k, v in tree.items()), reverse=True)
+    total = sum(n for n, _ in sizes)
+    print(f"\n提案 {len(sizes)} 个目录，共 {total} 条书签")
+    print("  最大的 10 个:")
+    for n, k in sizes[:10]:
+        print(f"    {n:>4} 条  {k}")
+    print("  最小的 10 个:")
+    for n, k in sizes[-10:]:
+        print(f"    {n:>4} 条  {k}")
+
+    empty = [k for k, v in tree.items() if len(v) == 0]
+    print(f"\n空目录: {len(empty)} 个 {empty[:5]}")
+    if sizes:
+        biggest = sizes[0][0]
+        print(f"最大目录占比: {biggest}/{total} = {biggest / total:.0%}")
+
+    exec_resp = send(page, {"type": "ORGANIZE_EXECUTE",
+                            "directoryTree": tree, "rootId": seeded["bar"]}, 600_000)
+    print(f"执行返回: {exec_resp.get('data')}")
+
+    after = page.evaluate(
+        """async ([bar]) => {
+            const out = [];
+            const walk = async (id, path) => {
+                for (const c of await chrome.bookmarks.getChildren(id)) {
+                    if (c.url) continue;
+                    const p = path ? path + '/' + c.title : c.title;
+                    const kids = await chrome.bookmarks.getChildren(c.id);
+                    out.push({ path: p, bookmarks: kids.filter(k => k.url).length,
+                               folders: kids.filter(k => !k.url).length });
+                    await walk(c.id, p);
+                }
+            };
+            await walk(bar, '');
+            return out;
+        }""",
+        [seeded["bar"]],
+    )
+    empty_after = [r for r in after if r["bookmarks"] == 0 and r["folders"] == 0]
+    print(f"\n执行后共 {len(after)} 个目录，其中完全空的 {len(empty_after)} 个")
+    for r in empty_after[:10]:
+        print(f"    空: {r['path']}")
+
+    page.evaluate(
+        """async ([bar]) => {
+            for (const c of await chrome.bookmarks.getChildren(bar)) {
+                try { await chrome.bookmarks.removeTree(c.id); } catch (e) {}
+            }
+        }""",
+        [seeded["bar"]],
+    )
+    return 0
+
+
 def main() -> int:
     # 域名模式不调 AI，不需要凭证
-    if not AI_KEY and MODE not in ("domain", "moveout-empty"):
+    if not AI_KEY and MODE not in ("domain",):
         print("缺少 BM_AI_KEY")
         return 2
 
@@ -523,7 +622,8 @@ def main() -> int:
                 }
                 return { bar, folder: folder.id, ids };
             }""",
-            DOMAIN_SEEDS if MODE == "domain"
+            SCALE_SEEDS if MODE == "scale"
+            else DOMAIN_SEEDS if MODE == "domain"
             else MOVEOUT_SEEDS if MODE == "folder-moveout"
             else SEEDS,
         )
@@ -534,6 +634,8 @@ def main() -> int:
 
         if MODE == "domain":
             return run_domain(page, seeded)
+        if MODE == "scale":
+            return run_scale(page, seeded)
         if MODE in ("moveout-empty", "moveout-empty-replan"):
             return run_moveout_empty(page)
         if MODE == "folder-moveout":

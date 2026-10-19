@@ -30,3 +30,6 @@ test/screenshots/
 
 # 端到端报告是每次运行重新生成的产物
 /test/verify-report.json
+
+# 真实书签导出（分析用，含用户隐私数据，绝不提交）
+/test/_real-bookmarks.json

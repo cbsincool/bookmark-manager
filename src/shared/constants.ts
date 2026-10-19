@@ -102,6 +102,14 @@ export const MAX_SUB_CLUSTERS = 8;
 /** 兜底目录名：既归不进任何目录、也不值得单独建目录的书签放这里 */
 export const UNCLASSIFIED_DIR = '未分类';
 
+/**
+ * 一次交给 AI 归档多少条书签。
+ *
+ * 一条一次调用太贵（1600 条 = 1600 次）；一批太多模型会漏答。
+ * 这个值让 1600 条约 55 次调用。
+ */
+export const MAX_BATCH_SIZE = 30;
+
 /** 溢出阶段新建目录的硬上限 */
 export const MAX_NEW_DIRS_CAP = 8;
 
