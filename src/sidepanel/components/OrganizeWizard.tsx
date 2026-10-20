@@ -44,7 +44,7 @@ export function OrganizeWizard() {
       await loadFolderStructure();
       store.setStep('scope');
     } catch (err) {
-      setErrorMsg(`操作失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.operation', { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       store.setProcessing(false);
     }
@@ -53,11 +53,11 @@ export function OrganizeWizard() {
   // --- After scope chosen (global), fetch bookmark IDs for connectivity ---
   const proceedToConnectivity = async () => {
     setErrorMsg('');
-    setProgressMsg('正在获取书签列表...');
+    setProgressMsg(t('organize.progress.fetchingBookmarks'));
     store.setProcessing(true);
     try {
       const allResp = await chrome.runtime.sendMessage({ type: 'GET_ALL_BOOKMARKS' });
-      if (!allResp?.success) throw new Error('获取书签失败');
+      if (!allResp?.success) throw new Error(t('organize.err.fetchBookmarks'));
       const bms = (allResp.data as BookmarkNode[]).filter(
         (bm) => !bm.path.includes('[待删除_失效]'),
       );
@@ -67,7 +67,7 @@ export function OrganizeWizard() {
       store.setStep('connectivity');
       setProgressMsg('');
     } catch (err) {
-      setErrorMsg(`操作失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.operation', { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       store.setProcessing(false);
     }
@@ -76,7 +76,7 @@ export function OrganizeWizard() {
   // --- After connectivity (or folder scope), load categories ---
   const proceedToCategory = async () => {
     setErrorMsg('');
-    setProgressMsg('正在获取收藏夹结构...');
+    setProgressMsg(t('organize.progress.fetchingFolders'));
     store.setProcessing(true);
     try {
       const tree = await chrome.bookmarks.getTree();
@@ -117,7 +117,7 @@ export function OrganizeWizard() {
       store.setStep('category');
       setProgressMsg('');
     } catch (err) {
-      setErrorMsg(`获取目录失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.fetchFolders', { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       store.setProcessing(false);
     }
@@ -137,7 +137,7 @@ export function OrganizeWizard() {
   // --- Category → Domain (global) or folder classify ---
   const handleCategoryNext = async () => {
     if (store.categories.length === 0) {
-      setErrorMsg('至少需要一个目录');
+      setErrorMsg(t('organize.err.needCategory'));
       return;
     }
     await saveCategories();
@@ -164,10 +164,10 @@ export function OrganizeWizard() {
         store.setConnectivityDeadCount(deadIds.length);
         setConnectivityDone(true);
       } else {
-        setErrorMsg(resp?.error || '连通性检测失败');
+        setErrorMsg(resp?.error || t('organize.err.connectivityFailed'));
       }
     } catch (err) {
-      setErrorMsg(`检测失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.checkFailed', { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       setConnectivityRunning(false);
     }
@@ -190,10 +190,10 @@ export function OrganizeWizard() {
         store.setDomainClusters(resp.data);
         store.setStep('domain');
       } else {
-        setErrorMsg(resp?.error || '分析失败，请重试');
+        setErrorMsg(resp?.error || t('organize.err.analyzeFailed'));
       }
     } catch (err) {
-      setErrorMsg(`操作失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.operation', { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       store.setProcessing(false);
       setProgressMsg('');
@@ -205,11 +205,11 @@ export function OrganizeWizard() {
     setErrorMsg('');
     store.setStep('classify');
     store.setProcessing(true);
-    setProgressMsg('正在准备书签数据...');
+    setProgressMsg(t('organize.progress.processing'));
 
     try {
       const allResp = await chrome.runtime.sendMessage({ type: 'GET_ALL_BOOKMARKS' });
-      if (!allResp?.success) throw new Error('获取书签失败');
+      if (!allResp?.success) throw new Error(t('organize.err.fetchBookmarks'));
 
       const allBookmarks = (allResp.data as { id: string; path: string }[]).filter(
         (bm) => !bm.path.includes('[待删除_失效]'),
@@ -246,7 +246,7 @@ export function OrganizeWizard() {
           mode: store.organizeMode,
         });
 
-        if (!startResp?.success) throw new Error(startResp?.error || '启动失败');
+        if (!startResp?.success) throw new Error(startResp?.error || t('organize.err.startFailed'));
 
         const taskId = (startResp.data as { taskId: string }).taskId;
         aiProposal = await pollClassifyTask(taskId);
@@ -270,7 +270,7 @@ export function OrganizeWizard() {
       store.setStep('preview');
       setProgressMsg('');
     } catch (err) {
-      setErrorMsg(`操作失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.operation', { error: err instanceof Error ? err.message : String(err) }));
       store.setStep('domain');
     } finally {
       store.setProcessing(false);
@@ -283,7 +283,7 @@ export function OrganizeWizard() {
     setErrorMsg('');
     store.setStep('classify');
     store.setProcessing(true);
-    setProgressMsg('正在启动语义分类...');
+    setProgressMsg(t('organize.progress.startingClassify'));
 
     try {
       const startResp = await chrome.runtime.sendMessage({
@@ -296,13 +296,13 @@ export function OrganizeWizard() {
         moveOutTargets: store.moveOutTargets,
       });
 
-      if (!startResp?.success) throw new Error(startResp?.error || '启动失败');
+      if (!startResp?.success) throw new Error(startResp?.error || t('organize.err.startFailed'));
 
       const taskId = (startResp.data as { taskId: string }).taskId;
       store.setProposal(await pollClassifyTask(taskId));
       store.setStep('preview');
     } catch (err) {
-      setErrorMsg(`操作失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.operation', { error: err instanceof Error ? err.message : String(err) }));
       store.setStep('category');
     } finally {
       store.setProcessing(false);
@@ -317,7 +317,7 @@ export function OrganizeWizard() {
       await new Promise((r) => setTimeout(r, 2000));
 
       const pollResp = await chrome.runtime.sendMessage({ type: 'ORGANIZE_AI_CLASSIFY_POLL', taskId });
-      if (!pollResp?.success) throw new Error(pollResp?.error || '轮询失败');
+      if (!pollResp?.success) throw new Error(pollResp?.error || t('organize.err.pollFailed'));
 
       const task = pollResp.data as {
         status: string;
@@ -327,7 +327,7 @@ export function OrganizeWizard() {
       };
 
       if (task.progress) {
-        setProgressMsg(task.progress.message || `处理中 (${task.progress.current}/${task.progress.total})`);
+        setProgressMsg(task.progress.message || t('organize.progress.processingCount', { current: task.progress.current, total: task.progress.total }));
       }
 
       if (task.status === 'completed' && task.result) {
@@ -341,9 +341,9 @@ export function OrganizeWizard() {
         };
       }
 
-      if (task.status === 'failed') throw new Error(task.error || '分类失败');
+      if (task.status === 'failed') throw new Error(task.error || t('organize.err.classifyFailed'));
     }
-    throw new Error('分类超时，请重试');
+    throw new Error(t('organize.err.classifyTimeout'));
   };
 
   // --- Execute ---
@@ -388,24 +388,24 @@ export function OrganizeWizard() {
         // 排查「没移到我指定的目录」这类问题时只能靠猜
         if (r.paths?.length) {
           setProgressMsg(
-            `${t('organize.execute.done')} — ${parts.join('，')}
+            `${t('organize.execute.done')} — ${parts.join(t('common.comma'))}
 ` +
-            `${t('organize.execute.paths')}: ${r.paths.slice(0, 12).join('、')}`,
+            `${t('organize.execute.paths')}: ${r.paths.slice(0, 12).join(t('common.listSep'))}`,
           );
           if (!r.failed) setTimeout(() => { store.reset(); setProgressMsg(''); }, 8000);
           return;
         }
 
-        setProgressMsg(`${t('organize.execute.done')} — ${parts.join('，')}`);
+        setProgressMsg(`${t('organize.execute.done')} — ${parts.join(t('common.comma'))}`);
         if (r.failures?.length) setErrorMsg(r.failures.join('\n'));
         if (!r.failed) {
           setTimeout(() => { store.reset(); setProgressMsg(''); }, 4000);
         }
       } else {
-        setErrorMsg(resp?.error || '执行失败');
+        setErrorMsg(resp?.error || t('organize.err.executeFailed'));
       }
     } catch (err) {
-      setErrorMsg(`执行失败: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMsg(t('organize.err.executeFailedDetail', { error: err instanceof Error ? err.message : String(err) }));
     } finally {
       store.setProcessing(false);
     }
@@ -442,13 +442,13 @@ export function OrganizeWizard() {
       <div className="p-4 space-y-4">
         <h2 className="text-base font-semibold text-gray-800">{t('organize.title')}</h2>
         {store.isProcessing ? (
-          <Spinner msg={progressMsg || '正在处理...'} />
+          <Spinner msg={progressMsg || t('organize.progress.processing')} />
         ) : (
           <>
-            <p className="text-sm text-gray-500">自动将书签按语义聚类，通过 AI 命名目录结构，支持最多 3 层子目录。</p>
+            <p className="text-sm text-gray-500">{t('organize.intro')}</p>
             <ErrorBanner />
             <button onClick={startOrganize} className="w-full py-2.5 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700">
-              开始整理
+              {t('organize.start')}
             </button>
           </>
         )}
@@ -510,11 +510,11 @@ export function OrganizeWizard() {
                     className="w-full px-4 py-2.5 text-left hover:bg-indigo-50 transition-colors"
                   >
                     <p className="text-sm text-gray-800">{folder.title}</p>
-                    <p className="text-xs text-gray-400">{folder.count} 个书签</p>
+                    <p className="text-xs text-gray-400">{t('organize.folderBookmarkCount', { count: folder.count })}</p>
                   </button>
                 ))}
                 {existingFolders.filter((f) => !f.path.includes('/')).length === 0 && (
-                  <p className="px-4 py-3 text-sm text-gray-400">无文件夹</p>
+                  <p className="px-4 py-3 text-sm text-gray-400">{t('organize.noFolders')}</p>
                 )}
               </div>
             </div>
@@ -531,7 +531,7 @@ export function OrganizeWizard() {
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-gray-700">
             {store.organizeScope === 'folder'
-              ? `整理文件夹：${store.organizeFolderName}`
+              ? t('organize.organizingFolder', { name: store.organizeFolderName })
               : t('organize.categoryStep')}
           </h3>
           <p className="text-xs text-gray-500">{t('organize.category.hint')}</p>
@@ -636,7 +636,7 @@ export function OrganizeWizard() {
               {store.isProcessing ? (
                 <span className="flex items-center justify-center gap-2">
                   <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
-                  {progressMsg || '处理中...'}
+                  {progressMsg || t('organize.progress.processing')}
                 </span>
               ) : t('organize.next')}
             </button>
@@ -648,7 +648,7 @@ export function OrganizeWizard() {
       {store.step === 'connectivity' && (
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-gray-700">{t('organize.connectivityStep')}</h3>
-          <p className="text-xs text-gray-500">检测失效链接（404/410），自动移入「待删除_失效」文件夹，不参与后续整理。</p>
+          <p className="text-xs text-gray-500">{t('organize.connectivity.hint')}</p>
 
           {connectivityRunning && connectivityProgress && (
             <div className="flex items-center gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg">
@@ -661,7 +661,7 @@ export function OrganizeWizard() {
             <div className="p-3 bg-green-50 border border-green-200 rounded-lg">
               <p className="text-sm text-green-700">
                 {store.connectivityDeadCount > 0
-                  ? `检测完成：发现 ${store.connectivityDeadCount} 个失效链接，已移入 [待删除_失效]`
+                  ? t('organize.connectivity.done', { count: store.connectivityDeadCount })
                   : t('organize.connectivity.noDead')}
               </p>
             </div>
@@ -674,7 +674,7 @@ export function OrganizeWizard() {
               className="flex-1 py-2 bg-orange-500 text-white text-sm rounded-lg hover:bg-orange-600 disabled:opacity-50 flex items-center justify-center gap-2"
             >
               {connectivityRunning && <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />}
-              {connectivityRunning ? '检测中...' : t('organize.connectivity.run')}
+              {connectivityRunning ? t('organize.progress.checking') : t('organize.connectivity.run')}
             </button>
           </div>
 

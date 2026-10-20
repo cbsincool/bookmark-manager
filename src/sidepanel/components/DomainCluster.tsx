@@ -21,7 +21,9 @@ export function DomainClusterView({ clusters, onToggle, onRename, onSelectAll, o
       <p className="text-xs text-gray-500">{t('organize.domainStep.hint')}</p>
 
       <div className="flex gap-2 items-center">
-        <span className="text-xs text-gray-400 flex-1">已选 {selectedCount}/{clusters.length} 个域名</span>
+        <span className="text-xs text-gray-400 flex-1">
+          {t('organize.domainStep.selected', { selected: selectedCount, total: clusters.length })}
+        </span>
         <button onClick={onSelectAll} className="text-xs text-indigo-600 hover:underline">{t('organize.domainStep.selectAll')}</button>
         <button onClick={onDeselectAll} className="text-xs text-gray-500 hover:underline">{t('organize.domainStep.deselectAll')}</button>
       </div>
@@ -72,7 +74,7 @@ export function DomainClusterView({ clusters, onToggle, onRename, onSelectAll, o
           </div>
         ))}
         {clusters.length === 0 && (
-          <p className="text-sm text-gray-400 text-center py-4">无域名数据</p>
+          <p className="text-sm text-gray-400 text-center py-4">{t('organize.domainStep.empty')}</p>
         )}
       </div>
 
