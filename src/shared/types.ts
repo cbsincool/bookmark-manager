@@ -146,7 +146,6 @@ export interface AppSettings {
   readonly realtimeArchiving: boolean;
   readonly onlyUseExistingDirectories: boolean;
   readonly organizeMaxDepth: 1 | 2 | 3;
-  readonly domainClusterMinCount: number;
   readonly urlNormStripUtm: boolean;
   readonly urlNormStripTrailingSlash: boolean;
   readonly urlNormStripHash: boolean;

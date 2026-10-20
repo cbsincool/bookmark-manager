@@ -60,7 +60,6 @@ export function SettingsPage() {
   const [apiEndpoint, setApiEndpoint] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiModel, setApiModel] = useState('');
-  const [domainMinCount, setDomainMinCount] = useState('');
 
   // Sync local state only once when settings finish loading
   useEffect(() => {
@@ -68,7 +67,6 @@ export function SettingsPage() {
       setApiEndpoint(settings.apiEndpoint);
       setApiKey(settings.apiKey);
       setApiModel(settings.apiModel);
-      setDomainMinCount(String(settings.domainClusterMinCount));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading]);
@@ -76,7 +74,6 @@ export function SettingsPage() {
   const handleBlurEndpoint = useCallback((v: string) => { updateSettings({ apiEndpoint: v }); setTestResult(null); }, [updateSettings]);
   const handleBlurKey = useCallback((v: string) => { updateSettings({ apiKey: v }); setTestResult(null); }, [updateSettings]);
   const handleBlurModel = useCallback((v: string) => { updateSettings({ apiModel: v }); setTestResult(null); }, [updateSettings]);
-  const handleBlurDomainMin = useCallback((v: string) => updateSettings({ domainClusterMinCount: parseInt(v) || 3 }), [updateSettings]);
 
   if (isLoading) {
     return <div className="p-4 text-gray-400">Loading...</div>;
@@ -92,10 +89,10 @@ export function SettingsPage() {
         const { ok, message } = resp.data as { ok: boolean; message: string };
         setTestResult(ok ? `✅ ${message}` : `❌ ${message}`);
       } else {
-        setTestResult(`❌ ${resp?.error ?? '测试失败'}`);
+        setTestResult(`❌ ${resp?.error ?? t('settings.ai.testFailed')}`);
       }
     } catch (err) {
-      setTestResult(`❌ 连接失败: ${err instanceof Error ? err.message : String(err)}`);
+      setTestResult(`❌ ${t('settings.ai.connectFailed', { error: err instanceof Error ? err.message : String(err) })}`);
     } finally {
       setIsTesting(false);
     }
@@ -135,7 +132,7 @@ export function SettingsPage() {
           placeholder={settings.apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://ai-gateway-inside.haplat.net/devops/v1'}
         />
         <TextInput
-          label={`${t('settings.ai.key')}（${settings.apiFormat === 'anthropic' ? '本地模型可留空' : '必填'}）`}
+          label={`${t('settings.ai.key')} (${settings.apiFormat === 'anthropic' ? t('settings.ai.keyOptional') : t('settings.ai.keyRequired')})`}
           value={apiKey}
           onChange={setApiKey}
           onBlur={handleBlurKey}
@@ -158,13 +155,13 @@ export function SettingsPage() {
             {isTesting && (
               <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
             )}
-            {isTesting ? '测试中...' : t('settings.ai.testConnection')}
+            {isTesting ? t('settings.ai.testing') : t('settings.ai.testConnection')}
           </button>
           {(!apiEndpoint || !apiModel) && (
-            <p className="text-xs text-gray-400">请填写端点和模型名称后再测试</p>
+            <p className="text-xs text-gray-400">{t('settings.ai.fillFirst')}</p>
           )}
           {testResult && (
-            <div className={`px-3 py-2 rounded-lg text-xs whitespace-pre-wrap break-all ${testResult.startsWith('✅') ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'}`}>
+            <div className={`px-3 py-2 rounded-lg text-xs whitespace-pre-wrap break-all border-l-2 ${testResult.startsWith('✅') ? 'border-l-success text-gray-700 bg-gray-50' : 'border-l-danger text-danger bg-gray-50'}`}>
               {testResult}
             </div>
           )}
@@ -194,13 +191,6 @@ export function SettingsPage() {
       <Section title={t('settings.organize.title')}>
         <Toggle label={t('settings.organize.realtimeArchiving')} checked={settings.realtimeArchiving} onChange={(v) => updateSettings({ realtimeArchiving: v })} />
         <Toggle label={t('settings.organize.onlyUseExistingDirectories')} checked={settings.onlyUseExistingDirectories} onChange={(v) => updateSettings({ onlyUseExistingDirectories: v })} />
-        <TextInput
-          label={t('settings.organize.domainMinCount')}
-          value={domainMinCount}
-          onChange={setDomainMinCount}
-          onBlur={handleBlurDomainMin}
-          placeholder="3"
-        />
         <label className="block">
           <span className="text-sm text-gray-600">{t('settings.organize.maxDepth')}: {settings.organizeMaxDepth ?? 3}</span>
           <input
@@ -241,7 +231,7 @@ export function SettingsPage() {
           </p>
         )}
         {rebuildProgress && (
-          <p className="text-xs text-indigo-600">{rebuildProgress.message}</p>
+          <p className="text-xs text-primary">{rebuildProgress.message}</p>
         )}
         <button
           onClick={handleRebuildIndex}
@@ -251,7 +241,7 @@ export function SettingsPage() {
           {isRebuilding && (
             <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
           )}
-          {isRebuilding ? '重建中...' : t('settings.index.rebuild')}
+          {isRebuilding ? t('settings.index.rebuilding') : t('settings.index.rebuild')}
         </button>
       </Section>
 

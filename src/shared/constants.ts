@@ -138,7 +138,6 @@ export const DEFAULT_SETTINGS: import('./types').AppSettings = {
   realtimeArchiving: true,
   onlyUseExistingDirectories: false,
   organizeMaxDepth: 3,
-  domainClusterMinCount: 3,
   urlNormStripUtm: true,
   urlNormStripTrailingSlash: true,
   urlNormStripHash: true,
