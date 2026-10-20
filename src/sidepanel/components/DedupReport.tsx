@@ -6,7 +6,71 @@ import { t } from '../i18n';
 import type { BookmarkNode, DedupGroup } from '@/shared/types';
 import { useProgressListener } from '../hooks/useProgressListener';
 
-// ---- Fine Dedup Result Panel ----
+/**
+ * 去重模块的视觉约定（与程序其余部分一致）：
+ *   - 主操作    bg-primary
+ *   - 次操作    border-gray-300 + text-gray-600
+ *   - 破坏性    bg-danger
+ *   - 彩色语义  只有「推荐保留」用 success，其余一切文字/边框走 gray
+ * 之前这里自创了一套紫色（全程序只有这个文件用），外加蓝/绿/黄/红混用，
+ * 按钮还挤在一行里换行——这次一并收敛。
+ */
+
+const SECONDARY_BTN =
+  'py-2 text-sm border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-50 cursor-pointer transition-colors disabled:opacity-50';
+const PRIMARY_BTN =
+  'w-full py-2.5 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-50 cursor-pointer transition-colors flex items-center justify-center gap-2';
+const TEXT_BTN = 'text-xs text-gray-500 hover:text-gray-700 cursor-pointer disabled:opacity-50';
+
+function Spinner({ className = 'border-white' }: { className?: string }) {
+  return (
+    <span className={`w-3.5 h-3.5 border-2 ${className} border-t-transparent rounded-full animate-spin inline-block`} />
+  );
+}
+
+// ---- 书签勾选列表（手动去重 / 精细去重共用）----
+
+interface BookmarkPickerProps {
+  readonly bookmarks: readonly BookmarkNode[];
+  readonly selectedIds: readonly string[];
+  readonly onToggle: (id: string) => void;
+  readonly hint: string;
+}
+
+function BookmarkPicker({ bookmarks, selectedIds, onToggle, hint }: BookmarkPickerProps) {
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-gray-500">{hint}</p>
+      <div className="space-y-1 max-h-80 overflow-y-auto">
+        {bookmarks.map((bm) => {
+          const selected = selectedIds.includes(bm.id);
+          return (
+            <label
+              key={bm.id}
+              className={`flex items-start gap-3 p-2 rounded-lg cursor-pointer transition-colors ${
+                selected ? 'bg-indigo-50 border border-indigo-200' : 'bg-white border border-gray-100 hover:bg-gray-50'
+              }`}
+            >
+              <input
+                type="checkbox"
+                checked={selected}
+                onChange={() => onToggle(bm.id)}
+                className="mt-0.5 w-4 h-4 text-primary rounded cursor-pointer"
+              />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-gray-800 truncate">{bm.title}</p>
+                <p className="text-xs text-gray-500 truncate">{bm.url}</p>
+                <p className="text-[10px] text-gray-400 truncate">{bm.path}</p>
+              </div>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---- 精细去重结果面板 ----
 
 function FineDedupResultPanel({
   result,
@@ -18,26 +82,22 @@ function FineDedupResultPanel({
   onClose: () => void;
 }) {
   const [selected, setSelected] = useState<Record<string, boolean>>({});
-
-  const toggleDelete = (id: string) => {
-    setSelected((prev) => ({ ...prev, [id]: !prev[id] }));
-  };
-
   const summaryMap = new Map(result.summaries.map((s) => [s.id, s]));
 
+  const toggleDelete = (id: string) => setSelected((prev) => ({ ...prev, [id]: !prev[id] }));
+
   if (!result.aiResult) {
-    // No AI — just show summaries for user to compare
     return (
       <div className="space-y-3">
         <p className="text-xs text-gray-500">{t('dedup.fine.noAi')}</p>
         {result.summaries.map((s) => (
           <div key={s.id} className="p-3 bg-white border border-gray-200 rounded-lg space-y-1">
-            <p className="text-sm font-medium text-gray-800 truncate">{s.title}</p>
-            <p className="text-xs text-blue-500 truncate">{s.url}</p>
+            <p className="text-sm text-gray-800 truncate">{s.title}</p>
+            <p className="text-xs text-gray-500 truncate">{s.url}</p>
             {s.summary && <p className="text-xs text-gray-500 line-clamp-2">{s.summary}</p>}
           </div>
         ))}
-        <button onClick={onClose} className="w-full py-2 text-sm border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-50">
+        <button onClick={onClose} className={`w-full ${SECONDARY_BTN}`}>
           {t('dedup.fine.close')}
         </button>
       </div>
@@ -54,26 +114,33 @@ function FineDedupResultPanel({
       {groups.map((g, i) => {
         const keepBm = summaryMap.get(g.keepId);
         return (
-          <div key={i} className="p-3 bg-indigo-50 border border-indigo-200 rounded-lg space-y-2">
-            <p className="text-xs text-indigo-600 font-medium">{g.reason}</p>
+          <div key={i} className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+            <p className="px-3 py-2 text-xs text-gray-600 bg-gray-50 border-b border-gray-200">{g.reason}</p>
+
             {keepBm && (
-              <div className="p-2 bg-green-50 border border-green-200 rounded">
-                <p className="text-xs text-green-700 font-medium">✓ {t('dedup.fine.recommend')}</p>
+              <div className="px-3 py-2 border-l-2 border-l-success bg-gray-50">
+                <p className="text-[10px] text-success">{t('dedup.fine.recommend')}</p>
                 <p className="text-sm text-gray-800 truncate">{keepBm.title}</p>
-                {keepBm.summary && <p className="text-xs text-gray-500 line-clamp-1">{keepBm.summary}</p>}
+                {keepBm.summary && (
+                  <p className="text-xs text-gray-500 line-clamp-1">{keepBm.summary}</p>
+                )}
               </div>
             )}
+
             {g.deleteIds.map((id) => {
               const bm = summaryMap.get(id);
               if (!bm) return null;
               const checked = selected[id] ?? true;
               return (
-                <label key={id} className="flex items-start gap-2 p-2 bg-white border border-gray-200 rounded cursor-pointer">
+                <label
+                  key={id}
+                  className="flex items-start gap-2 px-3 py-2 border-t border-gray-100 cursor-pointer hover:bg-gray-50"
+                >
                   <input
                     type="checkbox"
                     checked={checked}
                     onChange={() => toggleDelete(id)}
-                    className="mt-0.5 w-4 h-4 text-red-500 rounded"
+                    className="mt-0.5 w-4 h-4 text-danger rounded cursor-pointer"
                   />
                   <div className="flex-1 min-w-0">
                     <p className="text-sm text-gray-700 truncate">{bm.title}</p>
@@ -87,28 +154,25 @@ function FineDedupResultPanel({
       })}
 
       {standalone.length > 0 && (
-        <div className="p-3 bg-gray-50 border border-gray-200 rounded-lg">
+        <div className="p-3 bg-white border border-gray-200 rounded-lg">
           <p className="text-xs text-gray-500 mb-1">{t('dedup.fine.standalone')}</p>
           {standalone.map((id) => {
             const bm = summaryMap.get(id);
             return bm ? (
-              <p key={id} className="text-sm text-gray-700 truncate">• {bm.title}</p>
+              <p key={id} className="text-sm text-gray-600 truncate">{bm.title}</p>
             ) : null;
           })}
         </div>
       )}
 
       <div className="flex gap-2">
-        <button
-          onClick={onClose}
-          className="flex-1 py-2 text-sm border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-50"
-        >
+        <button onClick={onClose} className={`flex-1 ${SECONDARY_BTN}`}>
           {t('dedup.fine.close')}
         </button>
         {allDeleteIds.length > 0 && (
           <button
             onClick={() => onExecute(allDeleteIds)}
-            className="flex-1 py-2 text-sm bg-danger text-white rounded-lg hover:bg-red-700"
+            className="flex-1 py-2 text-sm bg-danger text-white rounded-lg hover:bg-red-700 cursor-pointer transition-colors"
           >
             {t('dedup.fine.execute', { count: allDeleteIds.length })}
           </button>
@@ -118,7 +182,7 @@ function FineDedupResultPanel({
   );
 }
 
-// ---- Main Component ----
+// ---- 主组件 ----
 
 export function DedupReport() {
   const {
@@ -143,9 +207,7 @@ export function DedupReport() {
     clearScanProgress();
     try {
       const resp = await chrome.runtime.sendMessage({ type: 'DEDUP_SCAN' });
-      if (resp?.success) {
-        setGroups(resp.data);
-      }
+      if (resp?.success) setGroups(resp.data);
     } catch (err) {
       console.error('Dedup scan failed:', err);
     } finally {
@@ -207,9 +269,13 @@ export function DedupReport() {
     }
   };
 
-  const handleEnterManualMode = async () => {
+  const loadBookmarks = async () => {
     const resp = await chrome.runtime.sendMessage({ type: 'GET_ALL_BOOKMARKS' });
     if (resp?.success) setAllBookmarks(resp.data as BookmarkNode[]);
+  };
+
+  const handleEnterManualMode = async () => {
+    await loadBookmarks();
     clearManualSelect();
     setManualMode(true);
   };
@@ -234,11 +300,8 @@ export function DedupReport() {
     }
   };
 
-  // --- Fine dedup ---
-
   const handleEnterFineMode = async () => {
-    const resp = await chrome.runtime.sendMessage({ type: 'GET_ALL_BOOKMARKS' });
-    if (resp?.success) setAllBookmarks(resp.data as BookmarkNode[]);
+    await loadBookmarks();
     enterFineMode();
   };
 
@@ -255,18 +318,18 @@ export function DedupReport() {
         setFineResult(resp.data as FineDedupResult);
         setFineStatusMsg('');
       } else {
-        setFineStatusMsg(`❌ ${resp?.error ?? t('dedup.fine.failed')}`);
+        setFineStatusMsg(resp?.error ?? t('dedup.fine.failed'));
       }
     } catch (err) {
-      setFineStatusMsg(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      setFineStatusMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setFineAnalyzing(false);
     }
   };
 
-  // Reflect backend progress in status message while analyzing
+  // 分析过程中把后端进度同步到状态行
   useEffect(() => {
-    if (fineAnalyzing && fineProgress?.message && !fineStatusMsg.startsWith('❌')) {
+    if (fineAnalyzing && fineProgress?.message) {
       setFineStatusMsg(fineProgress.message);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -288,147 +351,89 @@ export function DedupReport() {
 
   return (
     <div className="p-4 space-y-4">
+      {/* 标题栏：撤销 / 重置是低频操作，降级成文字按钮，不跟主操作抢视觉 */}
       <div className="flex items-center justify-between">
         <h2 className="text-base font-semibold text-gray-800">{t('dedup.title')}</h2>
-        <div className="flex gap-2 flex-wrap justify-end">
-          {deletedHistory.length > 0 && !isAnyMode && (
-            <button
-              onClick={handleUndo}
-              disabled={undoing}
-              className="px-3 py-1.5 text-xs border border-blue-300 text-blue-600 rounded-lg hover:bg-blue-50 disabled:opacity-50"
-            >
-              {undoing ? (
-                <span className="flex items-center gap-1">
-                  <span className="w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin inline-block" />
-                  {t('dedup.undo')}
-                </span>
-              ) : t('dedup.undo')}
+        <div className="flex items-center gap-3">
+          {isAnyMode ? (
+            <button onClick={manualMode ? handleExitManualMode : exitFineMode} className={TEXT_BTN}>
+              {t('dedup.manual.cancel')}
             </button>
-          )}
-
-          {!isAnyMode ? (
+          ) : (
             <>
+              {deletedHistory.length > 0 && (
+                <button onClick={handleUndo} disabled={undoing} className={TEXT_BTN}>
+                  {t('dedup.undo')}
+                </button>
+              )}
               {groups.length > 0 && (
-                <button onClick={reset} className="px-3 py-1.5 text-xs border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-50">
+                <button onClick={reset} className={TEXT_BTN}>
                   {t('dedup.reset')}
                 </button>
               )}
-              <button onClick={handleEnterManualMode} className="px-3 py-1.5 text-xs border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-50">
-                {t('dedup.manual.selectMode')}
-              </button>
-              <button onClick={handleEnterFineMode} className="px-3 py-1.5 text-xs border border-purple-300 text-purple-600 rounded-lg hover:bg-purple-50">
-                {t('dedup.fine.btn')}
-              </button>
-              <button
-                onClick={startScan}
-                disabled={isScanning}
-                className="px-4 py-2 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-50"
-              >
-                {isScanning ? (
-                  <span className="flex items-center gap-2">
-                    <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
-                    {scanProgress?.message ?? t('dedup.scanning')}
-                  </span>
-                ) : t('dedup.startScan')}
-              </button>
             </>
-          ) : (
-            <button
-              onClick={manualMode ? handleExitManualMode : exitFineMode}
-              className="px-3 py-1.5 text-xs text-gray-500 hover:text-gray-700"
-            >
-              {t('dedup.manual.cancel')}
-            </button>
           )}
         </div>
       </div>
 
-      {/* Manual select mode */}
+      {/* 操作区：主操作占满一行，两个模式入口并排作次按钮 */}
+      {!isAnyMode && (
+        <div className="space-y-2">
+          <button onClick={startScan} disabled={isScanning} className={PRIMARY_BTN}>
+            {isScanning ? (
+              <>
+                <Spinner />
+                {scanProgress?.message ?? t('dedup.scanning')}
+              </>
+            ) : (
+              t('dedup.startScan')
+            )}
+          </button>
+          <div className="grid grid-cols-2 gap-2">
+            <button onClick={handleEnterManualMode} className={SECONDARY_BTN}>
+              {t('dedup.manual.selectMode')}
+            </button>
+            <button onClick={handleEnterFineMode} className={SECONDARY_BTN}>
+              {t('dedup.fine.btn')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 手动选择模式 */}
       {manualMode && (
         <div className="space-y-2">
-          <p className="text-xs text-gray-500">{t('dedup.manual.hint')}</p>
-          <div className="space-y-1 max-h-80 overflow-y-auto">
-            {allBookmarks.map((bm) => {
-              const selected = manualSelectedIds.includes(bm.id);
-              return (
-                <label
-                  key={bm.id}
-                  className={`flex items-start gap-3 p-2 rounded-lg cursor-pointer transition-colors ${
-                    selected ? 'bg-indigo-50 border border-indigo-200' : 'bg-white border border-gray-100 hover:bg-gray-50'
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={selected}
-                    onChange={() => toggleManualSelect(bm.id)}
-                    className="mt-0.5 w-4 h-4 text-primary rounded"
-                  />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-gray-800 truncate">{bm.title}</p>
-                    <p className="text-xs text-blue-500 truncate">{bm.url}</p>
-                    <p className="text-xs text-gray-400">📁 {bm.path}</p>
-                  </div>
-                </label>
-              );
-            })}
-          </div>
+          <BookmarkPicker
+            bookmarks={allBookmarks}
+            selectedIds={manualSelectedIds}
+            onToggle={toggleManualSelect}
+            hint={t('dedup.manual.hint')}
+          />
           {manualSelectedIds.length >= 2 && (
-            <button
-              onClick={handleForceDedup}
-              disabled={isForcing}
-              className="w-full py-2.5 bg-warning text-white text-sm rounded-lg hover:bg-yellow-600 disabled:opacity-50"
-            >
+            <button onClick={handleForceDedup} disabled={isForcing} className={PRIMARY_BTN}>
               {isForcing ? t('dedup.processing') : t('dedup.manual.forceBtn', { count: manualSelectedIds.length })}
             </button>
           )}
         </div>
       )}
 
-      {/* Fine dedup mode */}
+      {/* 精细去重模式 */}
       {fineMode && (
         <div className="space-y-3">
           {!fineResult ? (
             <>
-              <p className="text-xs text-gray-500">{t('dedup.fine.hint')}</p>
-              <div className="space-y-1 max-h-72 overflow-y-auto">
-                {allBookmarks.map((bm) => {
-                  const sel = fineSelectedIds.includes(bm.id);
-                  return (
-                    <label
-                      key={bm.id}
-                      className={`flex items-start gap-3 p-2 rounded-lg cursor-pointer transition-colors ${
-                        sel ? 'bg-purple-50 border border-purple-200' : 'bg-white border border-gray-100 hover:bg-gray-50'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={sel}
-                        onChange={() => toggleFineSelect(bm.id)}
-                        className="mt-0.5 w-4 h-4 text-purple-600 rounded"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm text-gray-800 truncate">{bm.title}</p>
-                        <p className="text-xs text-blue-500 truncate">{bm.url}</p>
-                        <p className="text-xs text-gray-400">📁 {bm.path}</p>
-                      </div>
-                    </label>
-                  );
-                })}
-              </div>
-              {fineStatusMsg && (
-                <p className="text-xs text-gray-500">{fineStatusMsg}</p>
-              )}
+              <BookmarkPicker
+                bookmarks={allBookmarks}
+                selectedIds={fineSelectedIds}
+                onToggle={toggleFineSelect}
+                hint={t('dedup.fine.hint')}
+              />
+              {fineStatusMsg && <p className="text-xs text-gray-500">{fineStatusMsg}</p>}
               {fineSelectedIds.length >= 2 && (
-                <button
-                  onClick={handleFineAnalyze}
-                  disabled={fineAnalyzing}
-                  className="w-full py-2.5 bg-purple-600 text-white text-sm rounded-lg hover:bg-purple-700 disabled:opacity-50 flex items-center justify-center gap-2"
-                >
-                  {fineAnalyzing && (
-                    <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
-                  )}
+                <button onClick={handleFineAnalyze} disabled={fineAnalyzing} className={PRIMARY_BTN}>
+                  {fineAnalyzing && <Spinner />}
                   {fineAnalyzing
-                    ? fineStatusMsg || t('dedup.fine.analyzing')
+                    ? t('dedup.fine.analyzing')
                     : t('dedup.fine.analyzeBtn', { count: fineSelectedIds.length })}
                 </button>
               )}
@@ -446,14 +451,14 @@ export function DedupReport() {
       {isScanning && groups.length === 0 && (
         <div className="flex flex-col items-center py-8 space-y-3">
           <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-gray-400">{t('dedup.scanningHint')}</p>
+          <p className="text-sm text-gray-500">{t('dedup.scanningHint')}</p>
         </div>
       )}
 
       {!isScanning && !isAnyMode && groups.length === 0 && (
         <div className="text-center py-8 space-y-2">
-          <p className="text-sm text-gray-400">{t('dedup.noResults')}</p>
-          <p className="text-xs text-gray-300">{t('dedup.scanHint')}</p>
+          <p className="text-sm text-gray-500">{t('dedup.noResults')}</p>
+          <p className="text-xs text-gray-400">{t('dedup.scanHint')}</p>
         </div>
       )}
 
@@ -475,7 +480,7 @@ export function DedupReport() {
           </div>
           <button
             onClick={handleConfirmAll}
-            className="w-full py-2.5 bg-danger text-white text-sm rounded-lg hover:bg-red-700"
+            className="w-full py-2.5 bg-danger text-white text-sm rounded-lg hover:bg-red-700 cursor-pointer transition-colors"
           >
             {t('dedup.confirmAll')}
           </button>

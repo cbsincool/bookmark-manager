@@ -1,1 +1,17 @@
 @import 'tailwindcss';
+
+/*
+ * 设计令牌。
+ *
+ * ⚠️ 必须写在这里（Tailwind v4 的 CSS-first 写法），不能放在 tailwind.config.ts：
+ * 项目用的是 @tailwindcss/vite（v4），而 v4 **完全忽略** tailwind.config.ts，
+ * 除非用 @config 显式引用。之前令牌写在那个 v3 格式的配置文件里，结果
+ * `bg-primary` / `bg-danger` / `text-warning` / `text-success` 一条 CSS 都没生成——
+ * 所有主按钮、危险按钮、告警文字都渲染成了无样式，整个程序的视觉层级是塌的。
+ */
+@theme {
+  --color-primary: #4f46e5;
+  --color-danger: #dc2626;
+  --color-warning: #f59e0b;
+  --color-success: #10b981;
+}

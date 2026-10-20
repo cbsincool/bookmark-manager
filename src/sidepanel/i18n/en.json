@@ -69,6 +69,7 @@
   "dedup.confirmGroup": "Confirm",
   "dedup.skipGroup": "Skip",
   "dedup.confirmAll": "Confirm All & Execute",
+  "dedup.card.deleteCount": "{count} to delete",
   "dedup.scenario.exactUrl": "Exact URL Match",
   "dedup.scenario.sameTitle": "Same Title",
   "dedup.scenario.manual": "Manual Selection",

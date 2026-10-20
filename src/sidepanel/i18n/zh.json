@@ -69,6 +69,7 @@
   "dedup.confirmGroup": "确认",
   "dedup.skipGroup": "跳过",
   "dedup.confirmAll": "全部确认并执行",
+  "dedup.card.deleteCount": "将删除 {count} 条",
   "dedup.scenario.exactUrl": "URL 完全相同",
   "dedup.scenario.sameTitle": "标题相同",
   "dedup.scenario.manual": "手动勾选",
