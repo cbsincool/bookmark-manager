@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSemanticClusters, buildDomainClusters, mergeDirectoryTree } from '../organizeEngine';
+import { buildSemanticClusters, buildDomainClusters, mergeDirectoryTree, foldPathsIntoTopLevel, collapseTinyDirectories, foldNestedTopLevels, foldTutorialTopics } from '../organizeEngine';
 import {
   buildBatchClassifyPrompt,
   parseBatchClassifyResponse,
@@ -148,12 +148,12 @@ describe('mergeDirectoryTree', () => {
 
   it('appends unassigned bookmarks to the unclassified path', () => {
     const tree = mergeDirectoryTree([{ path: '编程', ids: ['a'] }], ['x', 'y']);
-    expect(tree).toEqual({ 编程: ['a'], 未分类: ['x', 'y'] });
+    expect(tree).toEqual({ 编程: ['a'], 其它: ['x', 'y'] });
   });
 
   it('honours a custom unclassified path (文件夹整理时要留在该文件夹内部)', () => {
-    const tree = mergeDirectoryTree([], ['x'], '工作/未分类');
-    expect(tree).toEqual({ '工作/未分类': ['x'] });
+    const tree = mergeDirectoryTree([], ['x'], '工作/其它');
+    expect(tree).toEqual({ '工作/其它': ['x'] });
   });
 });
 
@@ -171,11 +171,37 @@ describe('buildBatchClassifyPrompt', () => {
     expect(buildBatchClassifyPrompt(items, [], 3)).toContain('目前还没有任何目录');
   });
 
-  it('marks user-chosen targets as a hard constraint, not a suggestion', () => {
-    // 只把它列进「已有目录」不够——实测勾了目标，模型自作主张另建了一个目录
+  it('scopes user-chosen targets to move-out only, not to every bookmark', () => {
+    // 移出目标是**目的地白名单**，不是「所有书签都去这儿」。
+    // 早先的措辞写的是「所有书签都必须归入下面这几个目录之一」——照做的话
+    // 整个文件夹会被倒进某一个目标目录，与「只有更匹配的才移出去」正好相反。
     const prompt = buildBatchClassifyPrompt(items, ['localhost'], 3, ['localhost']);
-    expect(prompt).toContain('所有书签都必须归入');
-    expect(prompt).toContain('不要另建新目录');
+    expect(prompt).toContain('允许');
+    expect(prompt).toContain('仅限这些，不要另建');
+    expect(prompt).toContain('其余书签仍归入');
+    expect(prompt).not.toContain('所有书签都必须归入');
+  });
+
+  it('tells the model where each bookmark currently sits, so repeat runs stay stable', () => {
+    // 模型看不见书签现在在哪，就只能凭标题重猜——同一份书签两次整理结果不同，
+    // 实测 34% 的书签在两棵近义目录之间来回搬
+    const prompt = buildBatchClassifyPrompt(
+      [{ ...items[0], currentPath: '存储/硬盘' }],
+      ['存储/硬盘'],
+      3,
+    );
+    expect(prompt).toContain('[现在位于: 存储/硬盘]');
+    expect(prompt).toContain('保持稳定');
+  });
+
+  it('treats the user-configured category list as a hard top-level allowlist', () => {
+    // 软提示治不好「一级目录越攒越多」：模型照样沿用历史遗留的顶层目录。
+    // 只有把它写成硬约束，旧的顶层才会被搬空、被清掉。
+    const prompt = buildBatchClassifyPrompt(items, [], 3, [], ['技术文档', '兴趣爱好']);
+    expect(prompt).toContain('顶层目录只能从下面这些名字里选');
+    expect(prompt).toContain('技术文档');
+    expect(prompt).toContain('兴趣爱好');
+    expect(prompt).toContain('二级目录');
   });
 
   it('never shows a positive example that itself contains a space', () => {
@@ -221,5 +247,121 @@ describe('chunkItems', () => {
 
   it('returns nothing for an empty list', () => {
     expect(chunkItems([], 10)).toEqual([]);
+  });
+});
+
+describe('foldPathsIntoTopLevel', () => {
+  const STORAGE = /存储|RAID|NAS|SAN|硬盘/i;
+  const CONTAINERS = new Set(['存储', '存储设备']);
+
+  it('folds a nested storage path into the top-level storage folder', () => {
+    // 「存储」独立成一级后，`硬件/存储`、`技术/存储` 仍各留二三十条，
+    // 同一个主题被劈成三处
+    const { tree, moved } = foldPathsIntoTopLevel(
+      { '硬件/存储/RAID': ['a'], '技术/存储': ['b'] },
+      '存储', STORAGE, CONTAINERS,
+    );
+    expect(tree).toEqual({ '存储/RAID': ['a'], 存储: ['b'] });
+    expect(moved).toBe(2);
+  });
+
+  it('keeps the leaf when it carries information, drops it when it is a container word', () => {
+    const { tree } = foldPathsIntoTopLevel(
+      { '硬件/存储设备/硬盘': ['a'], '技术/存储设备': ['b'] },
+      '存储', STORAGE, CONTAINERS,
+    );
+    expect(tree).toEqual({ '存储/硬盘': ['a'], 存储: ['b'] });
+  });
+
+  it('leaves paths already under the target alone', () => {
+    const { tree, moved } = foldPathsIntoTopLevel(
+      { '存储/RAID': ['a'], '硬件/CPU': ['b'] },
+      '存储', STORAGE, CONTAINERS,
+    );
+    expect(tree).toEqual({ '存储/RAID': ['a'], '硬件/CPU': ['b'] });
+    expect(moved).toBe(0);
+  });
+
+  it('only looks below the top level, never the top itself', () => {
+    // 顶层就叫「存储」的路径不该被当成分散在别处
+    const { moved } = foldPathsIntoTopLevel({ 存储: ['a'] }, '存储', STORAGE, CONTAINERS);
+    expect(moved).toBe(0);
+  });
+});
+
+describe('collapseTinyDirectories — 受保护的顶层', () => {
+  it('does not flatten tiny subfolders of a protected top', () => {
+    // 合并会把 `Linux/内核`（只有 1 条）并回 `Linux`，
+    // 结果是书签全堆在一级目录下——那正是「没分类」的来源
+    const tree = { Linux: ['a'], 'Linux/内核': ['b'] };
+    const { tree: out, collapsed } = collapseTinyDirectories(tree, 2, new Set(['Linux']));
+    expect(out).toEqual({ Linux: ['a'], 'Linux/内核': ['b'] });
+    expect(collapsed).toBe(0);
+  });
+
+  it('still collapses tiny subfolders of unprotected tops', () => {
+    const tree = { 技术: ['a'], '技术/杂项': ['b'] };
+    const { tree: out, collapsed } = collapseTinyDirectories(tree, 2);
+    expect(out).toEqual({ 技术: ['a', 'b'] });
+    expect(collapsed).toBe(1);
+  });
+});
+
+describe('foldNestedTopLevels', () => {
+  const DOMAINS = new Set(['Linux', '存储', '网络', '虚拟化']);
+
+  it('pulls a nested domain top-level back out', () => {
+    // 实测 `技术/操作系统/Linux`、`技术/网络/RDMA`：同一个领域出现在两处
+    const { tree, folded } = foldNestedTopLevels(
+      { '技术/操作系统/Linux': ['a'], '技术/网络/RDMA': ['b'], '技术/网络': ['c'] },
+      DOMAINS,
+    );
+    expect(tree).toEqual({ Linux: ['a'], '网络/RDMA': ['b'], 网络: ['c'] });
+    expect(folded).toBe(3);
+  });
+
+  it('leaves non-domain tops alone (教程/网络 keeps its meaning)', () => {
+    // 教程是内容类型，「网络相关的教程」提走就丢了语义
+    const { tree, folded } = foldNestedTopLevels({ '教程/网络': ['a'] }, DOMAINS, new Set(['教程']));
+    expect(tree).toEqual({ '教程/网络': ['a'] });
+    expect(folded).toBe(0);
+  });
+
+  it('does not touch the top level itself', () => {
+    const { folded } = foldNestedTopLevels({ '网络/RDMA': ['a'] }, DOMAINS);
+    expect(folded).toBe(0);
+  });
+});
+
+describe('foldTutorialTopics', () => {
+  const tree = {
+    教程: ['t0'],
+    '教程/Python': ['a'],
+    '教程/OpenCV': ['b'],
+    '教程/硬件': ['c'],
+    技术: ['d'],
+    '技术/编程语言/Python': Array.from({ length: 20 }, (_, i) => `p${i}`),
+    硬件: Array.from({ length: 12 }, (_, i) => `h${i}`),
+    图像处理: ['x'],
+  };
+
+  it('moves a tutorial subfolder into the domain that already owns it', () => {
+    // 「教程/Python」本质是 Python 内容，应该待在 技术/编程语言/Python
+    const { tree: out } = foldTutorialTopics(tree, '教程', '其它');
+    expect(out['教程/Python']).toBeUndefined();
+    expect(out['技术/编程语言/Python']).toContain('a');
+  });
+
+  it('moves a tutorial subfolder named after a top-level into that top level', () => {
+    const { tree: out } = foldTutorialTopics(tree, '教程', '其它');
+    expect(out['教程/硬件']).toBeUndefined();
+    expect(out['硬件']).toContain('c');
+  });
+
+  it('keeps tutorials whose topic has no home elsewhere', () => {
+    // 教程/OpenCV 别处没有对应目录，留在教程里——它本来就是纯教学
+    const { tree: out } = foldTutorialTopics(tree, '教程', '其它');
+    expect(out['教程/OpenCV']).toEqual(['b']);
+    expect(out['教程']).toEqual(['t0']);
   });
 });

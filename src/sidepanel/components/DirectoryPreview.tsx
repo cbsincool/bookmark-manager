@@ -18,9 +18,9 @@ interface StatProps {
 /** 必须定义在模块层：放在组件体内会被 React 当成每次渲染的新组件类型，导致整棵子树重挂载 */
 function Stat({ label, value }: StatProps) {
   return (
-    <div className="bg-white rounded-lg border border-gray-200 px-2 py-1.5">
-      <div className="text-base font-semibold text-gray-800">{value}</div>
-      <div className="text-[10px] text-gray-500 leading-tight">{label}</div>
+    <div className="stat">
+      <div className="stat-value">{value}</div>
+      <div className="stat-label">{label}</div>
     </div>
   );
 }
@@ -61,9 +61,9 @@ function EditableName({ path, onCommit }: EditableNameProps) {
       }}
       spellCheck={false}
       title={t('organize.preview.renameTitle')}
-      className="min-w-0 flex-1 px-1.5 py-0.5 text-sm border border-dashed border-gray-300 rounded
-                 hover:border-solid hover:border-indigo-300 hover:bg-indigo-50/40
-                 focus:border-solid focus:border-indigo-400 focus:bg-white focus:outline-none"
+      className="min-w-0 flex-1 rounded-md border border-transparent px-1.5 py-0.5 text-[12px] text-gray-800
+                 transition-colors hover:border-gray-200 hover:bg-gray-50
+                 focus:border-indigo-400 focus:bg-white focus:outline-none"
     />
   );
 }
@@ -85,9 +85,12 @@ export function DirectoryPreview({
   };
 
   return (
-    <div className="space-y-4">
-      <h3 className="text-sm font-semibold text-gray-700">{t('organize.previewStep')}</h3>
-      <p className="text-xs text-gray-400">{t('organize.preview.renameHint')}</p>
+    <div className="space-y-4 enter">
+      <div className="space-y-1">
+        <p className="eyebrow">Organize · Preview</p>
+        <h3 className="text-[15px] font-semibold text-gray-900">{t('organize.previewStep')}</h3>
+      </div>
+      <p className="text-[11px] leading-relaxed text-gray-500">{t('organize.preview.renameHint')}</p>
 
       {(proposal.mergedFolderNames?.length ?? 0) > 1 && (
         <p className="text-[11px] text-gray-500">
@@ -122,25 +125,36 @@ export function DirectoryPreview({
         </div>
       )}
 
-      <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-1 text-sm">
+      <div className="list p-2 text-[12px]">
         {paths.map((path) => {
           const count = proposal.directoryTree[path].length;
           const isLowCohesion = proposal.lowCohesionPaths.includes(path);
           const isOverflow = overflowPaths.has(path);
-          const depth = path.split('/').length - 1;
-          const indent = '  '.repeat(depth);
+          const parts = path.split('/');
+          const leaf = parts[parts.length - 1];
+          const parentPath = parts.slice(0, -1).join('/');
+          const depth = parts.length - 1;
 
           return (
             <div
               key={path}
-              className={`flex items-center gap-2 ${isLowCohesion ? 'text-warning' : 'text-gray-700'}`}
+              className={`flex items-center gap-2 rounded-md px-1 py-1 ${isLowCohesion ? 'text-warning' : 'text-gray-700'}`}
+              // 缩进必须走 padding：原先是往 span 里塞 `'  '.repeat(depth)` 空格，
+              // 而 HTML 会把连续空格折叠掉——实测每一行的图标左偏移都是同一个值，
+              // 树被拍平成一个列表
+              style={{ paddingLeft: depth * 14 }}
             >
-              <span className="shrink-0 text-gray-400">
-                {indent}
+              <span className={`tree-icon shrink-0 ${isOverflow ? 'text-primary' : 'text-gray-500'}`}>
                 {isOverflow ? '📌' : '📁'}
               </span>
+              {/* 父路径要显出来。只显示叶子名时，`存储设备/硬盘` 和 `存储/硬盘`
+                  两行都是「硬盘」，缩进也一样（同层），根本分不出谁是谁；
+                  父目录没有直属书签时它自己根本没有行，层级也就无从对照 */}
+              {parentPath && (
+                <span className="shrink-0 text-xs text-gray-400">{parentPath}/</span>
+              )}
               <EditableName path={path} onCommit={(leaf) => renameLeaf(path, leaf)} />
-              <span className="shrink-0 text-xs text-gray-400">({count})</span>
+              <span className="tabular shrink-0 text-[11px] text-gray-400">{count}</span>
               {isOverflow && (
                 <span className="shrink-0 text-[10px] text-gray-400" title={t('organize.overflowDir')}>
                   {t('organize.overflowTag')}
@@ -161,16 +175,10 @@ export function DirectoryPreview({
       </div>
 
       <div className="flex gap-2">
-        <button
-          onClick={onExecute}
-          className="flex-1 py-2.5 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700"
-        >
+        <button onClick={onExecute} className="btn-grad flex-1">
           {t('organize.execute')}
         </button>
-        <button
-          onClick={onCancel}
-          className="px-4 py-2.5 text-sm text-gray-500 hover:text-gray-700"
-        >
+        <button onClick={onCancel} className="btn-tonal px-4">
           {t('organize.cancel')}
         </button>
       </div>

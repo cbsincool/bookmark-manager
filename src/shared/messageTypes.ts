@@ -10,12 +10,18 @@ export type MessageRequest =
   | { type: 'FETCH_PAGE_SUMMARY'; bookmarkId: string; url: string }
   | { type: 'FINE_DEDUP_ANALYZE'; bookmarkIds: readonly string[] }
   | { type: 'ORGANIZE_DOMAIN_CLUSTER' }
+  | { type: 'ORGANIZE_SUGGEST_TAXONOMY' }
   | { type: 'ORGANIZE_SEMANTIC_CLUSTER'; bookmarkIds: readonly string[] }
   | { type: 'ORGANIZE_CONNECTIVITY_CHECK'; bookmarkIds: readonly string[] }
   | { type: 'ORGANIZE_AI_CLASSIFY_START'; bookmarkIds: readonly string[]; scope: 'global' | 'folder'; folderId?: string; categories?: readonly string[]; mode?: import('./types').OrganizeMode; allowMoveOut?: boolean; moveOutTargets?: readonly string[] }
   | { type: 'ORGANIZE_AI_CLASSIFY_POLL'; taskId: string }
   | { type: 'ORGANIZE_EXECUTE'; directoryTree: Record<string, readonly string[]>; rootId: string }
+  | { type: 'ORGANIZE_SNAPSHOT_INFO' }
+  | { type: 'ORGANIZE_ROLLBACK' }
   | { type: 'GET_FOLDER_STRUCTURE' }
+  | { type: 'GET_FOLDER_BOOKMARKS'; folderId: string }
+  | { type: 'MOVE_BOOKMARKS'; ids: readonly string[]; targetFolderId: string }
+  | { type: 'MERGE_FOLDERS'; sourceIds: readonly string[]; targetFolderId: string }
   | { type: 'GET_SETTINGS' }
   | { type: 'UPDATE_SETTINGS'; settings: Partial<import('./types').AppSettings> }
   | { type: 'TEST_AI_CONNECTION' }

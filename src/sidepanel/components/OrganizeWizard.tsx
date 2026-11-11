@@ -1,9 +1,12 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useOrganizeStore } from '../stores/organizeStore';
 import { DomainClusterView } from './DomainCluster';
 import { DirectoryPreview } from './DirectoryPreview';
+import { ManagePanel } from './ManagePanel';
 import { t } from '../i18n';
 import { useProgressListener } from '../hooks/useProgressListener';
+import { mergeNearDuplicateNames } from '@/shared/directoryNaming';
+import { RULE_TOP_LEVELS } from '@/shared/constants';
 import type { BookmarkNode, OrganizeProposal } from '@/shared/types';
 
 interface FolderInfo {
@@ -11,6 +14,11 @@ interface FolderInfo {
   title: string;
   path: string;
   count: number;
+}
+
+interface UndoInfo {
+  available: boolean;
+  createdAt?: number;
 }
 
 export function OrganizeWizard() {
@@ -23,8 +31,64 @@ export function OrganizeWizard() {
   const [connectivityRunning, setConnectivityRunning] = useState(false);
   const [connectivityDone, setConnectivityDone] = useState(false);
   const [allBookmarkIds, setAllBookmarkIds] = useState<string[]>([]);
+  const [manualMode, setManualMode] = useState<'none' | 'move' | 'merge'>('none');
+  const [undoInfo, setUndoInfo] = useState<UndoInfo>({ available: false });
+  const [undoRunning, setUndoRunning] = useState(false);
 
   const { progress: connectivityProgress } = useProgressListener('CONNECTIVITY_CHECK_PROGRESS');
+
+  // --- Undo (撤销整理) ---
+  const loadUndoInfo = useCallback(async () => {
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'ORGANIZE_SNAPSHOT_INFO' });
+      setUndoInfo(resp?.success ? (resp.data as UndoInfo) : { available: false });
+    } catch {
+      setUndoInfo({ available: false });
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUndoInfo();
+  }, [loadUndoInfo]);
+
+  const handleUndo = async () => {
+    setUndoRunning(true);
+    setErrorMsg('');
+    setProgressMsg(t('organize.undo.running'));
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'ORGANIZE_ROLLBACK' });
+      if (!resp?.success) throw new Error(resp?.error || t('organize.undo.none'));
+
+      const r = (resp.data ?? {}) as {
+        restored?: number; inPlace?: number; foldersRecreated?: number;
+        foldersRemoved?: number; failed?: number; failures?: string[];
+      };
+
+      setProgressMsg(
+        t('organize.undo.done', {
+          restored: r.restored ?? 0,
+          inPlace: r.inPlace ?? 0,
+          recreated: r.foldersRecreated ?? 0,
+          removed: r.foldersRemoved ?? 0,
+        }),
+      );
+
+      // 失败时后台会**保留**快照，所以这里要把「可以再点一次」说清楚——
+      // 否则用户看到一堆失败原因，只会以为撤销已经废了
+      if (r.failed) {
+        const detail = r.failures?.length ? `\n${r.failures.join('\n')}` : '';
+        setErrorMsg(
+          `${t('organize.undo.retry', { failed: r.failed })}${detail}`,
+        );
+      }
+    } catch (err) {
+      setErrorMsg(t('organize.undo.failed', { error: err instanceof Error ? err.message : String(err) }));
+      setProgressMsg('');
+    } finally {
+      setUndoRunning(false);
+      void loadUndoInfo();
+    }
+  };
 
   // --- Load folder structure ---
   const loadFolderStructure = async () => {
@@ -107,12 +171,38 @@ export function OrganizeWizard() {
         .filter((node) => !node.url && node.title && node.id !== store.organizeFolderId)
         .map((node) => node.title);
       setMoveOutCandidates(barFolders);
-      // 默认全不勾：勾选才作为移出目标。用户的心智是「勾哪个就移到哪个」，
+      // 默认全不勾：勾选才作为移出目标。用户的心智「勾哪个就移到哪个」，
       // 默认全勾会逼他先取消再挑
       store.setMoveOutTargets([]);
 
-      const merged = new Set([...existingFolderNames, ...savedCategories]);
-      const categories = Array.from(merged);
+      // 一级目录的分类法。
+      //
+      // 全局整理时直接沿用现有顶层目录是不行的：实测会得到 31 个一级目录
+      // （「硬件/服务器硬件/电脑硬件/计算机硬件/Hardware」五个并存），
+      // 而旧结构一旦进了候选，模型就会照抄，永远收敛不下来。
+      // 所以先让模型把顶层收敛成一套 ≤12 个的分类法，用户在下面这步还能改。
+      let categories: string[] = [];
+      if (store.organizeScope === 'global') {
+        setProgressMsg(t('organize.progress.designingTaxonomy'));
+        const suggested = await chrome.runtime.sendMessage({ type: 'ORGANIZE_SUGGEST_TAXONOMY' });
+        const data = suggested?.success
+          ? (suggested.data as { names?: string[]; usedAi?: boolean })
+          : null;
+        if (data?.names?.length) categories = [...data.names];
+      }
+
+      if (categories.length === 0) {
+        // AI 不可用时的降级：至少把导入残渣去掉、把互相包含的名字合并掉
+        categories = mergeNearDuplicateNames([...existingFolderNames, ...savedCategories]);
+      }
+
+      // 规则类目（视频/购物/Linux/教程/其它）始终在列表里：
+      // 后台的规则层会往这些顶层里放东西，白名单缺了它们就会被兜底逻辑顶掉
+      categories = [
+        ...RULE_TOP_LEVELS.filter((n) => !categories.some((c) => c.toLowerCase() === n.toLowerCase())),
+        ...categories,
+      ];
+
       store.setCategories(categories.length > 0 ? categories : ['其他']);
       store.setStep('category');
       setProgressMsg('');
@@ -384,6 +474,15 @@ export function OrganizeWizard() {
         if (r.pruned) parts.push(`${t('organize.execute.pruned')} ${r.pruned}`);
         if (r.failed) parts.push(`${t('organize.execute.failed')} ${r.failed}`);
 
+        // 失败详情必须先摆出来。此前「写了路径就 return」的写法让下面那段
+        // 永远执行不到——而几乎每次整理都会写路径，等于失败原因从未显示过
+        if (r.failures?.length) {
+          setErrorMsg(`${t('organize.preview.failures')}\n${r.failures.join('\n')}`);
+        }
+
+        // 撤销入口跟着结果一起出现：整理刚把东西搬走，这时候才最需要「退回」
+        void loadUndoInfo();
+
         // 把实际用到的目录路径也显示出来——「东西被建到哪儿去了」原本完全看不见，
         // 排查「没移到我指定的目录」这类问题时只能靠猜
         if (r.paths?.length) {
@@ -397,7 +496,6 @@ export function OrganizeWizard() {
         }
 
         setProgressMsg(`${t('organize.execute.done')} — ${parts.join(t('common.comma'))}`);
-        if (r.failures?.length) setErrorMsg(r.failures.join('\n'));
         if (!r.failed) {
           setTimeout(() => { store.reset(); setProgressMsg(''); }, 4000);
         }
@@ -420,16 +518,16 @@ export function OrganizeWizard() {
 
   const ErrorBanner = () =>
     errorMsg ? (
-      <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg">
-        <p className="text-sm text-red-600">{errorMsg}</p>
-        <div className="flex gap-2 mt-2">
+      <div className="banner banner-error mb-3 flex-col items-start gap-1.5">
+        <span className="whitespace-pre-wrap">{errorMsg}</span>
+        <div className="flex gap-1">
           <button
             onClick={() => { setErrorMsg(''); setProgressMsg(''); store.reset(); }}
-            className="text-xs text-red-600 hover:text-red-700 font-medium"
+            className="btn-text text-danger"
           >
             {t('organize.reset')}
           </button>
-          <button onClick={() => setErrorMsg('')} className="text-xs text-red-400 hover:text-red-600">
+          <button onClick={() => setErrorMsg('')} className="btn-text text-gray-500">
             {t('organize.dismiss')}
           </button>
         </div>
@@ -438,18 +536,76 @@ export function OrganizeWizard() {
 
   // --- Idle step ---
   if (store.step === 'idle') {
+    // 手动调整：AI 归得不合适时的兜底，挂在整理页里而不是另开一个标签
+    if (manualMode !== 'none') {
+      return (
+        <ManagePanel
+          initialMode={manualMode}
+          onBack={() => { setManualMode('none'); void loadUndoInfo(); }}
+        />
+      );
+    }
+
     return (
-      <div className="p-4 space-y-4">
-        <h2 className="text-base font-semibold text-gray-800">{t('organize.title')}</h2>
-        {store.isProcessing ? (
+      <div className="p-4 space-y-5 enter">
+        <div className="space-y-1">
+          <p className="eyebrow">{t('organize.eyebrow.auto')}</p>
+          <h2 className="text-[17px] font-semibold text-gray-900">{t('organize.title')}</h2>
+          <p className="text-[12px] leading-relaxed text-gray-500">{t('organize.intro')}</p>
+        </div>
+
+        {store.isProcessing || undoRunning ? (
           <Spinner msg={progressMsg || t('organize.progress.processing')} />
         ) : (
           <>
-            <p className="text-sm text-gray-500">{t('organize.intro')}</p>
             <ErrorBanner />
-            <button onClick={startOrganize} className="w-full py-2.5 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700">
-              {t('organize.start')}
-            </button>
+            {progressMsg && (
+              <p className="text-sm text-gray-600 whitespace-pre-wrap">{progressMsg}</p>
+            )}
+
+            <div className="space-y-2">
+              <button onClick={startOrganize} className="btn-grad">
+                {t('organize.start')}
+              </button>
+              <p className="text-center text-[10px] text-gray-400">{t('organize.idle.note')}</p>
+            </div>
+
+            <section className="space-y-2">
+              <p className="group-label">{t('organize.group.other')}</p>
+              <div className="card divide-y divide-gray-100 overflow-hidden">
+              {undoInfo.available && (
+                <button onClick={handleUndo} className="action-row">
+                  <span className="action-icon">↺</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="action-title block">{t('organize.undo.action')}</span>
+                    <span className="action-sub block truncate">
+                      {new Date(undoInfo.createdAt ?? Date.now()).toLocaleString()} ·{' '}
+                      {t('organize.undo.rowSub')}
+                    </span>
+                  </span>
+                  <span className="action-chevron">›</span>
+                </button>
+              )}
+
+              <button onClick={() => setManualMode('move')} className="action-row">
+                <span className="action-icon">⇄</span>
+                <span className="min-w-0 flex-1">
+                  <span className="action-title block">{t('organize.manual.move')}</span>
+                  <span className="action-sub block">{t('organize.manual.moveHint')}</span>
+                </span>
+                <span className="action-chevron">›</span>
+              </button>
+
+              <button onClick={() => setManualMode('merge')} className="action-row">
+                <span className="action-icon">⇉</span>
+                <span className="min-w-0 flex-1">
+                  <span className="action-title block">{t('organize.manual.merge')}</span>
+                  <span className="action-sub block">{t('organize.manual.mergeHint')}</span>
+                </span>
+                <span className="action-chevron">›</span>
+                </button>
+              </div>
+            </section>
           </>
         )}
       </div>
@@ -457,70 +613,102 @@ export function OrganizeWizard() {
   }
 
   return (
-    <div className="p-4">
+    <div className="p-4 enter">
       <ErrorBanner />
 
       {/* --- Scope step --- */}
       {store.step === 'scope' && (
-        <div className="space-y-4">
-          <h3 className="text-sm font-semibold text-gray-700">{t('organize.scope.title')}</h3>
-          <p className="text-xs text-gray-500">{t('organize.scope.hint')}</p>
-
+        <div className="space-y-5">
           <div className="space-y-1">
-            <p className="text-xs font-medium text-gray-600">{t('organize.mode.title')}</p>
-            {(['fit', 'replan'] as const).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => store.setOrganizeMode(mode)}
-                className={`w-full px-3 py-2 text-left rounded-lg border transition-colors ${
-                  store.organizeMode === mode
-                    ? 'border-indigo-400 bg-indigo-50'
-                    : 'border-gray-200 hover:border-gray-300'
-                }`}
-              >
-                <p className="text-sm text-gray-800">
-                  {t(mode === 'fit' ? 'organize.mode.fit' : 'organize.mode.replan')}
-                </p>
-                <p className="text-xs text-gray-500">
-                  {t(mode === 'fit' ? 'organize.mode.fitHint' : 'organize.mode.replanHint')}
-                </p>
-              </button>
-            ))}
+            <p className="eyebrow">Organize · Scope</p>
+            <h3 className="text-[15px] font-semibold text-gray-900">{t('organize.scope.title')}</h3>
+            <p className="text-[11px] leading-relaxed text-gray-500">{t('organize.scope.hint')}</p>
           </div>
 
-          <div className="space-y-2">
-            <button
-              onClick={() => { store.setOrganizeScope('global'); proceedToConnectivity(); }}
-              className="w-full py-3 text-sm rounded-lg border border-gray-200 hover:bg-indigo-50 hover:border-indigo-300 text-left px-4"
-            >
-              <p className="font-medium text-gray-800">{t('organize.scope.global')}</p>
-              <p className="text-xs text-gray-500">{t('organize.scope.globalHint')}</p>
-            </button>
+          {/* 第一步：方式（二选一） */}
+          <section>
+            <div className="step">
+              <span className="step-mark">1</span>
+              <span className="step-label">{t('organize.mode.title')}</span>
+              <span className="step-hint">{t('organize.mode.choose')}</span>
+            </div>
+            <div className="choice-grid">
+              {(['fit', 'replan'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => store.setOrganizeMode(mode)}
+                  data-active={store.organizeMode === mode}
+                  className="choice"
+                >
+                  <span className="choice-title block">
+                    {t(mode === 'fit' ? 'organize.mode.fit' : 'organize.mode.replan')}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed text-gray-500">
+              {t(store.organizeMode === 'fit' ? 'organize.mode.fitHint' : 'organize.mode.replanHint')}
+            </p>
+          </section>
 
-            <div className="border border-gray-200 rounded-lg overflow-hidden">
-              <p className="px-4 py-2 text-xs font-medium text-gray-600 bg-gray-50">{t('organize.scope.folder')}</p>
-              <div className="max-h-48 overflow-y-auto divide-y divide-gray-100">
-                {existingFolders.filter((f) => !f.path.includes('/')).map((folder) => (
-                  <button
-                    key={folder.id}
-                    onClick={() => {
-                      store.setOrganizeScope('folder', folder.id, folder.title);
-                      proceedToCategory();
-                    }}
-                    className="w-full px-4 py-2.5 text-left hover:bg-indigo-50 transition-colors"
-                  >
-                    <p className="text-sm text-gray-800">{folder.title}</p>
-                    <p className="text-xs text-gray-400">{t('organize.folderBookmarkCount', { count: folder.count })}</p>
-                  </button>
-                ))}
-                {existingFolders.filter((f) => !f.path.includes('/')).length === 0 && (
-                  <p className="px-4 py-3 text-sm text-gray-400">{t('organize.noFolders')}</p>
-                )}
+          {/* 第二步：范围（全局 或 某个文件夹） */}
+          <section>
+            <div className="step">
+              <span className="step-mark">2</span>
+              <span className="step-label">{t('organize.scope.choose')}</span>
+            </div>
+
+            <div className="space-y-2">
+              {/* 路径 A：全局 */}
+              <div className="card overflow-hidden">
+                <button
+                  onClick={() => { store.setOrganizeScope('global'); proceedToConnectivity(); }}
+                  className="option-row"
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="option-title block">{t('organize.scope.global')}</span>
+                    <span className="option-sub block">{t('organize.scope.globalHint')}</span>
+                  </span>
+                  <span className="action-chevron">›</span>
+                </button>
+              </div>
+
+              <p className="or-rule">{t('organize.scope.or')}</p>
+
+              {/* 路径 B：指定文件夹 */}
+              <div className="card overflow-hidden">
+                <p className="section-cap">{t('organize.scope.folder')}</p>
+                <div className="max-h-52 divide-y divide-gray-100 overflow-y-auto">
+                  {existingFolders.filter((f) => !f.path.includes('/')).map((folder) => (
+                    <button
+                      key={folder.id}
+                      onClick={() => {
+                        store.setOrganizeScope('folder', folder.id, folder.title);
+                        proceedToCategory();
+                      }}
+                      className="option-row"
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="option-title block truncate">{folder.title}</span>
+                        <span className="option-sub block">
+                          {t('organize.folderBookmarkCount', { count: folder.count })}
+                        </span>
+                      </span>
+                      <span className="action-chevron">›</span>
+                    </button>
+                  ))}
+                  {existingFolders.filter((f) => !f.path.includes('/')).length === 0 && (
+                    <p className="px-3 py-3 text-[11px] text-gray-400">{t('organize.noFolders')}</p>
+                  )}
+                </div>
               </div>
             </div>
-          </div>
+          </section>
 
-          <button onClick={() => store.reset()} className="w-full py-2 text-sm text-gray-500 hover:text-gray-700">
+          <button
+            onClick={() => store.reset()}
+            className="w-full py-2 text-[12px] text-gray-500 transition-colors hover:text-gray-700"
+          >
             {t('organize.cancel')}
           </button>
         </div>
@@ -528,53 +716,59 @@ export function OrganizeWizard() {
 
       {/* --- Category step --- */}
       {store.step === 'category' && (
-        <div className="space-y-4">
-          <h3 className="text-sm font-semibold text-gray-700">
-            {store.organizeScope === 'folder'
-              ? t('organize.organizingFolder', { name: store.organizeFolderName })
-              : t('organize.categoryStep')}
-          </h3>
-          <p className="text-xs text-gray-500">{t('organize.category.hint')}</p>
+        <div className="space-y-5">
+          <div className="space-y-1">
+            <p className="eyebrow">Organize · Taxonomy</p>
+            <h3 className="text-[15px] font-semibold text-gray-900">
+              {store.organizeScope === 'folder'
+                ? t('organize.organizingFolder', { name: store.organizeFolderName })
+                : t('organize.categoryStep')}
+            </h3>
+            <p className="text-[11px] leading-relaxed text-gray-500">
+              {store.organizeScope === 'global'
+                ? t('organize.category.taxonomyHint')
+                : t('organize.category.hint')}
+            </p>
+          </div>
+
           {store.organizeScope === 'folder' && (
-            <label className="flex items-start gap-2 p-2 rounded-lg border border-gray-200 cursor-pointer">
+            <label className="card flex cursor-pointer items-start gap-2.5 p-3">
               <input
                 type="checkbox"
                 checked={store.allowMoveOut}
                 onChange={(e) => store.setAllowMoveOut(e.target.checked)}
-                className="mt-0.5 w-4 h-4 text-primary rounded"
+                className="mt-0.5 h-4 w-4 rounded"
               />
               <span>
-                <span className="block text-sm text-gray-700">{t('organize.allowMoveOut')}</span>
-                <span className="block text-xs text-gray-500">
+                <span className="block text-[12px] text-gray-800">{t('organize.allowMoveOut')}</span>
+                <span className="block text-[10px] leading-relaxed text-gray-500">
                   {t(store.allowMoveOut ? 'organize.allowMoveOutHint' : 'organize.keepInsideHint')}
                 </span>
               </span>
             </label>
           )}
+
           {store.organizeScope === 'folder' && store.allowMoveOut && (
-            <div className="p-2 rounded-lg border border-gray-200 space-y-1">
-              <p className="text-xs text-gray-500">{t('organize.moveOutTargets')}</p>
+            <div className="card space-y-2 p-3">
+              <p className="text-[10px] text-gray-500">{t('organize.moveOutTargets')}</p>
               {store.organizeMode === 'replan' && (
-                <p className="text-xs text-amber-600">{t('organize.moveOutOverridesReplan')}</p>
+                <p className="text-[10px] text-warning">{t('organize.moveOutOverridesReplan')}</p>
               )}
               {moveOutCandidates.length === 0 && (
-                <p className="text-xs text-gray-400">{t('organize.moveOutNoTargets')}</p>
+                <p className="text-[10px] text-gray-400">{t('organize.moveOutNoTargets')}</p>
               )}
-              <div className="flex flex-wrap gap-1">
+              <div className="flex flex-wrap gap-1.5">
                 {moveOutCandidates.map((name) => (
                   <label
                     key={name}
-                    className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-xs cursor-pointer ${
-                      store.moveOutTargets.includes(name)
-                        ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
-                        : 'border-gray-200 text-gray-600'
-                    }`}
+                    data-active={store.moveOutTargets.includes(name)}
+                    className="chip cursor-pointer"
                   >
                     <input
                       type="checkbox"
                       checked={store.moveOutTargets.includes(name)}
                       onChange={() => store.toggleMoveOutTarget(name)}
-                      className="w-3 h-3"
+                      className="h-3 w-3"
                     />
                     {name}
                   </label>
@@ -582,63 +776,76 @@ export function OrganizeWizard() {
               </div>
             </div>
           )}
-          {store.organizeMode === 'fit' && (
-            <p className="text-xs text-gray-400">{t('organize.category.fitNote')}</p>
-          )}
 
-          <div className="flex flex-wrap gap-2">
-            {store.categories.map((cat) => (
-              <div key={cat} className="flex items-center gap-1 px-2 py-1 bg-gray-100 rounded-lg text-sm">
-                <span>{cat}</span>
-                <button
-                  onClick={() => store.removeCategory(cat)}
-                  disabled={store.categories.length <= 1}
-                  className="text-gray-400 hover:text-red-500 disabled:opacity-30"
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-          </div>
+          <section className="space-y-2">
+            <div className="step">
+              <span className="step-label">{t('organize.category.listLabel')}</span>
+              <span className="step-hint">{store.categories.length}</span>
+            </div>
 
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={newCategory}
-              onChange={(e) => setNewCategory(e.target.value)}
-              placeholder={t('organize.category.add')}
-              className="flex-1 px-3 py-1.5 text-sm border border-gray-200 rounded-lg"
-            />
+            <div className="flex flex-wrap gap-1.5">
+              {store.categories.map((cat) => (
+                <div key={cat} className="chip">
+                  <span>{cat}</span>
+                  <button
+                    onClick={() => store.removeCategory(cat)}
+                    disabled={store.categories.length <= 1}
+                    className="chip-x"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={newCategory}
+                onChange={(e) => setNewCategory(e.target.value)}
+                placeholder={t('organize.category.add')}
+                className="field flex-1"
+              />
+              <button
+                onClick={() => {
+                  const trimmed = newCategory.trim();
+                  if (trimmed && !store.categories.includes(trimmed)) {
+                    store.addCategory(trimmed);
+                    setNewCategory('');
+                  }
+                }}
+                disabled={!newCategory.trim() || store.categories.includes(newCategory.trim())}
+                className="btn-tonal shrink-0"
+              >
+                {t('organize.category.add')}
+              </button>
+            </div>
+
+            {store.organizeMode === 'fit' && (
+              <p className="text-[10px] leading-relaxed text-gray-400">{t('organize.category.fitNote')}</p>
+            )}
+          </section>
+
+          <div className="flex gap-2 pt-1">
             <button
-              onClick={() => {
-                const trimmed = newCategory.trim();
-                if (trimmed && !store.categories.includes(trimmed)) {
-                  store.addCategory(trimmed);
-                  setNewCategory('');
-                }
-              }}
-              disabled={!newCategory.trim() || store.categories.includes(newCategory.trim())}
-              className="px-3 py-1.5 text-xs bg-primary text-white rounded-lg disabled:opacity-40"
+              onClick={() => store.setStep(store.organizeScope === 'global' ? 'connectivity' : 'scope')}
+              className="btn-tonal flex-1"
             >
-              {t('organize.category.add')}
-            </button>
-          </div>
-
-          <div className="flex gap-2 pt-2 border-t">
-            <button onClick={() => store.setStep(store.organizeScope === 'global' ? 'connectivity' : 'scope')} className="flex-1 py-2 bg-gray-100 text-gray-700 text-sm rounded-lg hover:bg-gray-200">
               {t('organize.back')}
             </button>
             <button
               onClick={handleCategoryNext}
               disabled={store.isProcessing}
-              className="flex-1 py-2 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+              className="btn-grad flex-1"
             >
               {store.isProcessing ? (
                 <span className="flex items-center justify-center gap-2">
-                  <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />
+                  <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
                   {progressMsg || t('organize.progress.processing')}
                 </span>
-              ) : t('organize.next')}
+              ) : (
+                t('organize.next')
+              )}
             </button>
           </div>
         </div>
@@ -646,48 +853,49 @@ export function OrganizeWizard() {
 
       {/* --- Connectivity step (global only) --- */}
       {store.step === 'connectivity' && (
-        <div className="space-y-4">
-          <h3 className="text-sm font-semibold text-gray-700">{t('organize.connectivityStep')}</h3>
-          <p className="text-xs text-gray-500">{t('organize.connectivity.hint')}</p>
+        <div className="space-y-5">
+          <div className="space-y-1">
+            <p className="eyebrow">Organize · Links</p>
+            <h3 className="text-[15px] font-semibold text-gray-900">{t('organize.connectivityStep')}</h3>
+            <p className="text-[11px] leading-relaxed text-gray-500">{t('organize.connectivity.hint')}</p>
+          </div>
 
           {connectivityRunning && connectivityProgress && (
-            <div className="flex items-center gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-              <span className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin inline-block" />
-              <p className="text-sm text-blue-700">{connectivityProgress.message}</p>
+            <div className="banner banner-info">
+              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+              <span>{connectivityProgress.message}</span>
             </div>
           )}
 
           {connectivityDone && (
-            <div className="p-3 bg-green-50 border border-green-200 rounded-lg">
-              <p className="text-sm text-green-700">
+            <div className={`banner ${store.connectivityDeadCount > 0 ? 'banner-warn' : 'banner-ok'}`}>
+              <span>
                 {store.connectivityDeadCount > 0
                   ? t('organize.connectivity.done', { count: store.connectivityDeadCount })
                   : t('organize.connectivity.noDead')}
-              </p>
+              </span>
             </div>
           )}
 
-          <div className="flex gap-2">
-            <button
-              onClick={handleRunConnectivity}
-              disabled={connectivityRunning}
-              className="flex-1 py-2 bg-orange-500 text-white text-sm rounded-lg hover:bg-orange-600 disabled:opacity-50 flex items-center justify-center gap-2"
-            >
-              {connectivityRunning && <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />}
-              {connectivityRunning ? t('organize.progress.checking') : t('organize.connectivity.run')}
-            </button>
-          </div>
+          <button onClick={handleRunConnectivity} disabled={connectivityRunning} className="btn-tonal w-full">
+            {connectivityRunning && (
+              <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            )}
+            {connectivityRunning ? t('organize.progress.checking') : t('organize.connectivity.run')}
+          </button>
 
-          <div className="flex gap-2 pt-2 border-t">
-            <button onClick={() => store.setStep('scope')} className="flex-1 py-2 bg-gray-100 text-gray-700 text-sm rounded-lg hover:bg-gray-200">
+          <div className="flex gap-2 pt-1">
+            <button onClick={() => store.setStep('scope')} className="btn-tonal flex-1">
               {t('organize.back')}
             </button>
             <button
               onClick={handleConnectivityNext}
               disabled={store.isProcessing || connectivityRunning}
-              className="flex-1 py-2 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center gap-2"
+              className="btn-grad flex-1"
             >
-              {store.isProcessing && <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin inline-block" />}
+              {store.isProcessing && (
+                <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
+              )}
               {connectivityDone ? t('organize.next') : t('organize.connectivity.skip')}
             </button>
           </div>

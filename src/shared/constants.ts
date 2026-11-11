@@ -1,5 +1,5 @@
 export const DB_NAME = 'bookmark-manager';
-export const DB_VERSION = 4;
+export const DB_VERSION = 5;
 
 export const STORES = {
   VECTORS: 'vectors',
@@ -8,6 +8,8 @@ export const STORES = {
   SETTINGS: 'settings',
   DELETED_BOOKMARKS: 'deletedBookmarks',
   PAGE_SUMMARIES: 'pageSummaries',
+  /** 最近一次整理的拆卸点，供「撤销整理」还原（单级，id 恒为 'last'） */
+  ORGANIZE_SNAPSHOTS: 'organizeSnapshots',
   /**
    * 已废弃：整理曾用「已归类标记」跳过重复整理，现改为「以现有目录为骨架」，
    * 不再需要记账。常量保留只为在 DB 升级时把这个历史 store 删掉。
@@ -15,26 +17,12 @@ export const STORES = {
   CLASSIFIED_BOOKMARKS: 'classifiedBookmarks',
 } as const;
 
-// 向量嵌入服务（tei-bge-m3）
-// 注意：model-server 于 2026-04 重部署，旧端口 9080-9084 已全部失效
-export const EMBEDDING_API_URL = 'http://10.3.28.194:8080';
+// 向量嵌入服务（TEI，bge-m3 兼容）。默认指向本机，可在设置页改成任意 TEI 地址。
+export const DEFAULT_EMBEDDING_ENDPOINT = 'http://localhost:8080';
 export const EMBEDDING_DIM = 1024; // bge-m3 输出维度
 
-// 重排序服务（tei-bge-reranker）
-export const RERANKER_API_URL = 'http://10.3.28.194:8081';
-
-// 已下线的 LLM 端点。a800 网关自 2026-08-25 起整体 403，历史配置若仍指向它，
-// 读取设置时会自动迁移到 DEFAULT_SETTINGS 的端点，否则 AI 功能会静默失效。
-export const DEPRECATED_API_ENDPOINTS: readonly string[] = [
-  'https://api-ai.haplat.net/a800',
-];
-
-// 已下架的模型名。deepseek-v4-flash-0731 于 2026-10 被 inside 网关下架，
-// 请求直接返回 400「模型已下架，请使用替代模型 deepseek-v4.1-flash」。
-// 只迁移 endpoint 盖不住这种情况——老用户存着旧模型名会一直 400。
-export const DEPRECATED_API_MODELS: readonly string[] = [
-  'deepseek-v4-flash-0731',
-];
+// 重排序服务（TEI，bge-reranker 兼容）。同样可在设置页修改。
+export const DEFAULT_RERANKER_ENDPOINT = 'http://localhost:8081';
 
 export const BATCH_SIZE = 50;
 export const API_BATCH_SIZE = 30;
@@ -96,11 +84,65 @@ export const MAX_LEAF_SIZE = 25;
 export const MIN_SPLITTABLE_SIZE = 8;
 /** 一级目录数量上限 */
 export const MAX_TOP_CLUSTERS = 20;
+/**
+ * 一级目录的**软上限**，用于「分类法设计」这一步。
+ *
+ * 该用户实测 31 个一级目录，`硬件 / 服务器硬件 / 电脑硬件 / 计算机硬件 / Hardware`
+ * 五个并存——顶层越碎，模型越没法定，人也找不到。12 个左右既覆盖主题又保持可扫视。
+ * 用户仍可在向导里增删，这个值只约束 AI 给出的默认分类法。
+ */
+export const MAX_TOP_LEVELS = 12;
 /** 每个一级目录下的子目录数量上限 */
 export const MAX_SUB_CLUSTERS = 8;
 
+// --- 确定性整理规则用到的顶层目录 ---
+// 名字放在 shared：后台的规则层和侧边栏的分类法 UI 必须用同一套写法，
+// 否则白名单里写「视频」、规则产出「视频 」，兜底逻辑会把规则结果顶掉。
+export const VIDEO_TOP = '视频';
+export const SHOPPING_TOP = '购物';
+export const LINUX_TOP = 'Linux';
+export const TUTORIAL_TOP = '教程';
+/** 公司内网/办公系统：不属于技术领域，单独成一级 */
+export const WORK_TOP = '工作';
+/** 操作系统一级目录。Linux 已是独立顶层，Windows 对称处理 */
+export const WINDOWS_TOP = 'Windows';
+
+/** 用户点名要保留的一级目录：GitHub 的书签全部聚在这里 */
+export const GITHUB_TOP = 'Github';
+/** 这些顶层不参与「补二级目录」——用户要的就是它们平铺在一级目录下 */
+export const NO_SPLIT_TOPS: readonly string[] = [GITHUB_TOP];
+
+/** 用户明确要求独立成一级目录的主题（不依赖模型提议） */
+export const NETWORK_TOP = '网络';
+export const STORAGE_TOP = '存储';
+export const VIRTUALIZATION_TOP = '虚拟化';
+
+/** 一级目录至少要装这么多条书签；不够的并进兜底目录（顶层是给「领域」用的） */
+export const MIN_TOP_FOR_KEEP = 3;
+
+/** 一级目录下直接躺着的书签超过这个数，就单独跑一轮「补二级目录」 */
+export const MIN_BARE_FOR_SPLIT = 10;
+
+/** 「其它」少于这个条数就不值得再跑一轮二次处理——几条书签拆不出主题 */
+export const MIN_FALLBACK_FOR_REFINE = 5;
+
 /** 兜底目录名：既归不进任何目录、也不值得单独建目录的书签放这里 */
-export const UNCLASSIFIED_DIR = '未分类';
+export const UNCLASSIFIED_DIR = '其它';
+
+/**
+ * 必须细分的顶层：这些主题天生有二级维度（Linux 下的内核/驱动、教程下的知识领域…）。
+ * 书签直接躺在这里等于没整理，所以要再跑一次「二级目录」补全。
+ */
+export const NESTED_TOPS: readonly string[] = [
+  LINUX_TOP, TUTORIAL_TOP, STORAGE_TOP, NETWORK_TOP, VIRTUALIZATION_TOP,
+];
+
+/** 规则会产出的顶层；分类法必须包含它们，否则白名单会把规则结果顶掉 */
+export const RULE_TOP_LEVELS: readonly string[] = [
+  VIDEO_TOP, SHOPPING_TOP, LINUX_TOP, TUTORIAL_TOP,
+  NETWORK_TOP, STORAGE_TOP, VIRTUALIZATION_TOP,
+  GITHUB_TOP, WORK_TOP, UNCLASSIFIED_DIR,
+];
 
 /**
  * 一次交给 AI 归档多少条书签。
@@ -125,13 +167,15 @@ export function maxNewDirectories(overflowCount: number): number {
 }
 
 export const DEFAULT_SETTINGS: import('./types').AppSettings = {
-  // LLM 网关（OpenAI 兼容）。默认指向 inside 网关的 deepseek flash；
-  // 端点为死值时 AI 功能（分类命名/精细去重/实时归档兜底）会整体不可用，
-  // 用户可在设置页改成任意 OpenAI 或 Anthropic 兼容端点。
-  apiEndpoint: 'https://ai-gateway-inside.haplat.net/devops/v1',
+  // LLM 网关（OpenAI 兼容）。默认指向 OpenAI 官方端点；AI 功能（分类命名 /
+  // 精细去重 / 实时归档兜底）都走这里，可在设置页改成任意 OpenAI 或 Anthropic
+  // 兼容端点（本地 Ollama、vLLM、one-api 等都可以）。
+  apiEndpoint: 'https://api.openai.com/v1',
   apiKey: '',
-  apiModel: 'deepseek-v4.1-flash',
+  apiModel: 'gpt-4o-mini',
   apiFormat: 'openai',
+  embeddingEndpoint: DEFAULT_EMBEDDING_ENDPOINT,
+  rerankerEndpoint: DEFAULT_RERANKER_ENDPOINT,
   searchFuzzyWeight: 0.4,
   searchSemanticWeight: 0.6,
   collapseThreshold: 0.85,

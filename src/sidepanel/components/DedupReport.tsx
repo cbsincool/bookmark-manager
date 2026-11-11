@@ -172,7 +172,7 @@ function FineDedupResultPanel({
         {allDeleteIds.length > 0 && (
           <button
             onClick={() => onExecute(allDeleteIds)}
-            className="flex-1 py-2 text-sm bg-danger text-white rounded-lg hover:bg-red-700 cursor-pointer transition-colors"
+            className="btn-danger flex-1"
           >
             {t('dedup.fine.execute', { count: allDeleteIds.length })}
           </button>
@@ -480,7 +480,7 @@ export function DedupReport() {
           </div>
           <button
             onClick={handleConfirmAll}
-            className="w-full py-2.5 bg-danger text-white text-sm rounded-lg hover:bg-red-700 cursor-pointer transition-colors"
+            className="btn-danger w-full"
           >
             {t('dedup.confirmAll')}
           </button>

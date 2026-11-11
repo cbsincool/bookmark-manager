@@ -1,14 +1,17 @@
-import { RERANKER_API_URL } from '@/shared/constants';
+import { DEFAULT_RERANKER_ENDPOINT } from '@/shared/constants';
 
 /**
- * Rerank candidate texts against a query using tei-bge-reranker HTTP API.
- * Returns scores in the same order as the input texts.
+ * Rerank candidate texts against a query using a TEI (bge-reranker compatible)
+ * HTTP API. Returns scores in the same order as the input texts.
+ * `endpoint` comes from AppSettings.rerankerEndpoint.
  */
 export async function rerank(
   query: string,
   texts: readonly string[],
+  endpoint: string = DEFAULT_RERANKER_ENDPOINT,
 ): Promise<number[]> {
-  const resp = await fetch(`${RERANKER_API_URL}/rerank`, {
+  const base = (endpoint.trim() || DEFAULT_RERANKER_ENDPOINT).replace(/\/+$/, '');
+  const resp = await fetch(`${base}/rerank`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, texts }),

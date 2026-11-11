@@ -60,6 +60,8 @@ export function SettingsPage() {
   const [apiEndpoint, setApiEndpoint] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiModel, setApiModel] = useState('');
+  const [embeddingEndpoint, setEmbeddingEndpoint] = useState('');
+  const [rerankerEndpoint, setRerankerEndpoint] = useState('');
 
   // Sync local state only once when settings finish loading
   useEffect(() => {
@@ -67,6 +69,8 @@ export function SettingsPage() {
       setApiEndpoint(settings.apiEndpoint);
       setApiKey(settings.apiKey);
       setApiModel(settings.apiModel);
+      setEmbeddingEndpoint(settings.embeddingEndpoint);
+      setRerankerEndpoint(settings.rerankerEndpoint);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoading]);
@@ -74,6 +78,8 @@ export function SettingsPage() {
   const handleBlurEndpoint = useCallback((v: string) => { updateSettings({ apiEndpoint: v }); setTestResult(null); }, [updateSettings]);
   const handleBlurKey = useCallback((v: string) => { updateSettings({ apiKey: v }); setTestResult(null); }, [updateSettings]);
   const handleBlurModel = useCallback((v: string) => { updateSettings({ apiModel: v }); setTestResult(null); }, [updateSettings]);
+  const handleBlurEmbedding = useCallback((v: string) => { updateSettings({ embeddingEndpoint: v }); }, [updateSettings]);
+  const handleBlurReranker = useCallback((v: string) => { updateSettings({ rerankerEndpoint: v }); }, [updateSettings]);
 
   if (isLoading) {
     return <div className="p-4 text-gray-400">Loading...</div>;
@@ -129,7 +135,7 @@ export function SettingsPage() {
           value={apiEndpoint}
           onChange={setApiEndpoint}
           onBlur={handleBlurEndpoint}
-          placeholder={settings.apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://ai-gateway-inside.haplat.net/devops/v1'}
+          placeholder={settings.apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'}
         />
         <TextInput
           label={`${t('settings.ai.key')} (${settings.apiFormat === 'anthropic' ? t('settings.ai.keyOptional') : t('settings.ai.keyRequired')})`}
@@ -144,7 +150,7 @@ export function SettingsPage() {
           value={apiModel}
           onChange={setApiModel}
           onBlur={handleBlurModel}
-          placeholder={settings.apiFormat === 'anthropic' ? 'claude-sonnet-5-5' : 'deepseek-v4.1-flash'}
+          placeholder={settings.apiFormat === 'anthropic' ? 'claude-sonnet-5-5' : 'gpt-4o-mini'}
         />
         <div className="space-y-2">
           <button
@@ -166,6 +172,24 @@ export function SettingsPage() {
             </div>
           )}
         </div>
+      </Section>
+
+      <Section title={t('settings.semantic.title')}>
+        <TextInput
+          label={t('settings.semantic.embedding')}
+          value={embeddingEndpoint}
+          onChange={setEmbeddingEndpoint}
+          onBlur={handleBlurEmbedding}
+          placeholder="http://localhost:8080"
+        />
+        <TextInput
+          label={t('settings.semantic.reranker')}
+          value={rerankerEndpoint}
+          onChange={setRerankerEndpoint}
+          onBlur={handleBlurReranker}
+          placeholder="http://localhost:8081"
+        />
+        <p className="text-xs text-gray-400">{t('settings.semantic.hint')}</p>
       </Section>
 
       <Section title={t('settings.search.title')}>

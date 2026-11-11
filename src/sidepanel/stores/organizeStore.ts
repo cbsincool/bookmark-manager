@@ -82,16 +82,31 @@ export const useOrganizeStore = create<OrganizeState>((set, get) => ({
     const proposal = get().proposal;
     if (!proposal || from === to) return;
 
-    const ids = proposal.directoryTree[from];
-    if (!ids) return;
+    // 改名必须**连子路径一起搬**。只换自己那个 key 的话，`RAID` 改成 `RENAMED_X`
+    // 之后 `RAID/MegaCli` 还挂在旧路径下，执行时会把两棵都建出来——
+    // 实测结果是 `硬件/RENAMED_X` 和 `硬件/RAID/MegaCli` 同时存在，树被劈成两半。
+    const remap = (path: string): string => {
+      if (path === from) return to;
+      if (path.startsWith(`${from}/`)) return `${to}${path.slice(from.length)}`;
+      return path;
+    };
 
-    // 换 key 即可：执行阶段是按路径 findOrCreateFolderPath，
-    // 旧名字没被引用就不会建出来（方案 A：只管新建的目录）
-    const directoryTree = { ...proposal.directoryTree };
-    delete directoryTree[from];
-    directoryTree[to] = [...(directoryTree[to] ?? []), ...ids];
+    const next: Record<string, readonly string[]> = {};
+    for (const [path, bookmarkIds] of Object.entries(proposal.directoryTree)) {
+      const target = remap(path);
+      next[target] = [...(next[target] ?? []), ...bookmarkIds];
+    }
 
-    set({ proposal: { ...proposal, directoryTree } });
+    set({
+      proposal: {
+        ...proposal,
+        directoryTree: next,
+        // 标注也要跟着改，否则改名之后「新建」「内聚度低」的标记会留在旧路径上，
+        // 界面上就再也对不上——重命名联动了子路径，这些标记的错位面也跟着变大
+        lowCohesionPaths: proposal.lowCohesionPaths.map(remap),
+        overflowPaths: proposal.overflowPaths?.map(remap),
+      },
+    });
   },
   setProposal: (proposal) => set({ proposal }),
   setProcessing: (isProcessing) => set({ isProcessing }),

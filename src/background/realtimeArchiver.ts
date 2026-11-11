@@ -17,11 +17,11 @@ export async function handleNewBookmark(
 
   const text = `${bookmark.title} ${bookmark.url}`;
 
-  // Generate embedding via tei-bge-m3 (1024-dim).
+  // Generate embedding via the configured TEI service (1024-dim for bge-m3).
   // Must use the same model as handleRebuildIndex / handleSearch, otherwise the
   // vector written here lives in a different space and cosine similarity against
   // the rest of the index is meaningless (and dimension mismatch yields NaN).
-  const vector = await generateEmbedding(text);
+  const vector = await generateEmbedding(text, settings.embeddingEndpoint);
 
   // Save to index
   await db.putVector({ id: bookmark.id, vector, text, updatedAt: Date.now() });
@@ -72,7 +72,7 @@ export async function handleNewBookmark(
           // 所以这里不能用归一化后的名字——用户自己建的 "React Hooks" 带空格，
           // 归一化成 "ReactHooks" 反而永远匹配不上
           if ((existingPaths ?? []).includes(firstPath)) {
-            const folderId = await findOrCreateFolderPath(firstPath.split('/'), rootId);
+            const { id: folderId } = await findOrCreateFolderPath(firstPath.split('/'), rootId);
             await moveBookmark(bookmark.id, folderId);
             chrome.notifications.create({
               type: 'basic',
@@ -94,7 +94,7 @@ export async function handleNewBookmark(
           // 这类带空格的名字——「禁空格」的规则只在生成新名字时适用
           const newPath = normalizeDirectoryPath(firstPath);
           if (newPath) {
-            const folderId = await findOrCreateFolderPath(newPath.split('/'), rootId);
+            const { id: folderId } = await findOrCreateFolderPath(newPath.split('/'), rootId);
             await moveBookmark(bookmark.id, folderId);
             chrome.notifications.create({
               type: 'basic',

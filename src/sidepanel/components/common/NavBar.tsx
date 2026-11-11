@@ -17,19 +17,16 @@ const tabs: { key: Tab; labelKey: string; icon: string }[] = [
 
 export function NavBar({ activeTab, onTabChange }: NavBarProps) {
   return (
-    <nav className="flex border-b border-gray-200 bg-white">
+    <nav className="bottom-nav">
       {tabs.map((tab) => (
         <button
           key={tab.key}
           onClick={() => onTabChange(tab.key)}
-          className={`flex-1 py-3 text-sm font-medium text-center transition-colors ${
-            activeTab === tab.key
-              ? 'text-primary border-b-2 border-primary'
-              : 'text-gray-500 hover:text-gray-700'
-          }`}
+          data-active={activeTab === tab.key}
+          className="nav-item"
         >
-          <span className="block text-lg">{tab.icon}</span>
-          <span>{t(tab.labelKey)}</span>
+          <span className="nav-icon">{tab.icon}</span>
+          <span className="nav-label">{t(tab.labelKey)}</span>
         </button>
       ))}
     </nav>

@@ -25,7 +25,7 @@ export function SearchResultCard({ result, isRecommended }: SearchResultCardProp
           {Math.round(hybridScore * 100)}%
         </span>
       </div>
-      <p className="text-xs text-blue-500 truncate mt-1">{bookmark.url}</p>
+      <p className="mt-1 truncate text-[10px] text-gray-400">{bookmark.url}</p>
       {bookmark.path && (
         <p className="text-xs text-gray-400 mt-1">📁 {bookmark.path}</p>
       )}

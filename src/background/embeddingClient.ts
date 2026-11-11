@@ -1,4 +1,4 @@
-import { EMBEDDING_API_URL, EMBEDDING_MAX_BATCH } from '@/shared/constants';
+import { DEFAULT_EMBEDDING_ENDPOINT, EMBEDDING_MAX_BATCH } from '@/shared/constants';
 
 /** 空文本会被 TEI 以 400 拒绝，并连带整批失败，故用占位符保持批次对齐。 */
 const EMPTY_TEXT_PLACEHOLDER = '(untitled)';
@@ -7,8 +7,14 @@ function sanitize(text: string): string {
   return text.trim().length > 0 ? text : EMPTY_TEXT_PLACEHOLDER;
 }
 
-async function embedChunk(texts: readonly string[]): Promise<Float32Array[]> {
-  const resp = await fetch(`${EMBEDDING_API_URL}/embed`, {
+/** 用户可能在设置页把末尾斜杠也填进来，拼接前统一去掉 */
+function normalizeEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  return (trimmed || DEFAULT_EMBEDDING_ENDPOINT).replace(/\/+$/, '');
+}
+
+async function embedChunk(texts: readonly string[], endpoint: string): Promise<Float32Array[]> {
+  const resp = await fetch(`${normalizeEndpoint(endpoint)}/embed`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ inputs: texts }),
@@ -26,11 +32,14 @@ async function embedChunk(texts: readonly string[]): Promise<Float32Array[]> {
 }
 
 /**
- * Generate a single embedding vector via tei-bge-m3 HTTP API.
- * No API key required.
+ * Generate a single embedding vector via a TEI (bge-m3 compatible) HTTP API.
+ * No API key required. `endpoint` comes from AppSettings.embeddingEndpoint.
  */
-export async function generateEmbedding(text: string): Promise<Float32Array> {
-  const [vector] = await embedChunk([sanitize(text)]);
+export async function generateEmbedding(
+  text: string,
+  endpoint: string = DEFAULT_EMBEDDING_ENDPOINT,
+): Promise<Float32Array> {
+  const [vector] = await embedChunk([sanitize(text)], endpoint);
   if (!vector) throw new Error('Embedding API returned no vector');
   return vector;
 }
@@ -42,7 +51,10 @@ export async function generateEmbedding(text: string): Promise<Float32Array> {
  * beyond that, so chunking happens here rather than at every call site.
  * Returned vectors are positionally aligned with the input texts.
  */
-export async function generateEmbeddingsBatch(texts: readonly string[]): Promise<Float32Array[]> {
+export async function generateEmbeddingsBatch(
+  texts: readonly string[],
+  endpoint: string = DEFAULT_EMBEDDING_ENDPOINT,
+): Promise<Float32Array[]> {
   if (texts.length === 0) return [];
 
   const safe = texts.map(sanitize);
@@ -50,7 +62,7 @@ export async function generateEmbeddingsBatch(texts: readonly string[]): Promise
 
   for (let i = 0; i < safe.length; i += EMBEDDING_MAX_BATCH) {
     const chunk = safe.slice(i, i + EMBEDDING_MAX_BATCH);
-    out.push(...await embedChunk(chunk));
+    out.push(...await embedChunk(chunk, endpoint));
   }
 
   return out;

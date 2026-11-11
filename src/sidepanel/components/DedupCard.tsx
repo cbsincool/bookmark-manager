@@ -88,7 +88,7 @@ export function DedupCard({ group, onKeepChange, onConfirm, onSkip }: DedupCardP
         </button>
         <button
           onClick={onConfirm}
-          className="px-3 py-1.5 text-xs bg-danger text-white rounded-lg hover:bg-red-700 cursor-pointer"
+          className="btn-danger"
         >
           {t('dedup.confirmGroup')}
         </button>

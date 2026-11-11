@@ -140,6 +140,10 @@ export interface AppSettings {
   readonly apiKey: string;
   readonly apiModel: string;
   readonly apiFormat: 'openai' | 'anthropic';
+  /** TEI 嵌入服务地址（bge-m3 兼容），如 http://localhost:8080 */
+  readonly embeddingEndpoint: string;
+  /** TEI 重排序服务地址（bge-reranker 兼容），如 http://localhost:8081 */
+  readonly rerankerEndpoint: string;
   readonly searchFuzzyWeight: number;
   readonly searchSemanticWeight: number;
   readonly collapseThreshold: number;
@@ -184,4 +188,51 @@ export interface FineDedupResult {
     readonly keepId: string;
     readonly reason: string;
   }[];
+}
+
+/**
+ * 整理前的一棵书签树节点。
+ *
+ * 存的是**位置**而不是内容：回退要做的事就是「把每条书签放回原来的父目录、原来的序位」，
+ * 所以 id/parentId/index 三样缺一不可。`url` 只用来在回退时校验节点还在不在。
+ */
+export interface SnapshotNode {
+  readonly id: string;
+  readonly parentId: string;
+  readonly title: string;
+  readonly url?: string;
+  readonly index: number;
+}
+
+/**
+ * 一次整理的「拆卸点」。
+ *
+ * 只保留最近一次（id 恒为 'last'）：整理是可反复运行的操作，多级历史会让
+ * 「撤销」这个动作本身变得需要选择，而用户想要的只是「把刚才那次退回去」。
+ */
+export interface OrganizeSnapshot {
+  readonly id: string;
+  readonly createdAt: number;
+  /** 整理前整棵树的节点（含所有根，因为书签可能被移出作用域） */
+  readonly nodes: readonly SnapshotNode[];
+  /** 本次整理**新建**的目录 id —— 回退时要把它们删掉，否则会留下一堆空壳 */
+  readonly createdFolderIds: readonly string[];
+}
+
+export interface RollbackResult {
+  readonly restored: number;
+  /** 本来就在原位、无需搬动的条数。和 restored 分开报，理由同 moved/inPlace */
+  readonly inPlace: number;
+  readonly foldersRecreated: number;
+  readonly foldersRemoved: number;
+  readonly failed: number;
+  readonly failures: readonly string[];
+  /**
+   * 被删除或换了 id 的目录。
+   *
+   * 实时归档用的目录向量按目录 id 存，这些 id 已经失效——不清掉的话，
+   * 新收藏一条书签会被自动归进一个不存在的目录。只清这些，
+   * 不动其它目录的向量（它们跟本次回退无关）。
+   */
+  readonly affectedFolderIds: readonly string[];
 }

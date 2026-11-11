@@ -1,21 +1,29 @@
-import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder, getExistingFolders, resolveMergeGroup, collectSubtreeBookmarkIds, getFolderPathRelativeTo } from './bookmarkService';
+import { getAllBookmarks, moveBookmark, removeBookmark, findOrCreateFolderPath, getRootFolderId, getDirectoryPathsUnder, getExistingFolders, resolveMergeGroup, collectSubtreeBookmarkIds, getFolderPathRelativeTo, pruneEmptiedFolders, getFolderBookmarks, moveBookmarks, mergeFolders } from './bookmarkService';
+import { captureSnapshot, rollbackToSnapshot, SNAPSHOT_ID } from './organizeHistory';
+import { suggestTaxonomy, reclassifyIntoAllowlist, refineFallback, splitBareAssignments, type ExistingTopLevel } from './taxonomy';
+import { applyRules, RULE_TOP_LEVELS, STORAGE_HINTS, STORAGE_CONTAINER_NAMES, LINUX_SUB_ALIASES, LINUX_ALLOWED_SUBS, LINUX_SUB_FALLBACK } from './organizeRules';
+import { STORAGE_TOP, LINUX_TOP, NETWORK_TOP, VIRTUALIZATION_TOP, VIDEO_TOP, SHOPPING_TOP, GITHUB_TOP, TUTORIAL_TOP, WORK_TOP, WINDOWS_TOP } from '@/shared/constants';
+import { progressText } from './progressText';
 import { generateEmbedding, generateEmbeddingsBatch } from './embeddingClient';
 import { rerank } from './rerankerClient';
 import { findExactUrlDuplicates, findSameTitleDuplicates, scoreL1, scoreL2Content, scoreL3, buildDedupGroups } from './dedupEngine';
-import { buildDomainClusters, computeDirectoryVector, buildSemanticClusters, mergeDirectoryTree } from './organizeEngine';
+import { buildDomainClusters, computeDirectoryVector, buildSemanticClusters, mergeDirectoryTree, collapseTinyDirectories, foldPathsIntoTopLevel, normalizeSubfoldersUnderTop, foldSmallTopLevels, foldNestedTopLevels, foldTutorialTopics } from './organizeEngine';
 import { classifyBookmarks } from './aiClassifier';
 import { callCloudAPI, resolveChatEndpoint, resolveMessagesEndpoint, buildClassificationPrompt, parseClassificationResponse, isLowInfoTitle, buildFineDedupPrompt, parseFineDedupResponse } from './apiClient';
 import { handleNewBookmark } from './realtimeArchiver';
 import { BookmarkDB } from '@/shared/db';
 import { cosineSimilarity } from '@/shared/vectorSearch';
-import { DEFAULT_SETTINGS, BATCH_SIZE, MAX_BATCH_SIZE, DEPRECATED_API_ENDPOINTS, DEPRECATED_API_MODELS, LEGACY_DEFAULT_CATEGORIES, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS } from '@/shared/constants';
-import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats, OrganizeMode } from '@/shared/types';
+import { DEFAULT_SETTINGS, BATCH_SIZE, MAX_BATCH_SIZE, LEGACY_DEFAULT_CATEGORIES, ASSIGN_ACCEPT_THRESHOLD, UNCLASSIFIED_DIR, NEUTRAL_SCORE, DEDUP_WEIGHTS, STORES, MIN_FALLBACK_FOR_REFINE, MIN_BARE_FOR_SPLIT, MIN_TOP_FOR_KEEP, NO_SPLIT_TOPS } from '@/shared/constants';
+import type { AppSettings, QualityScores, BookmarkNode, OrganizeStats, OrganizeMode, OrganizeSnapshot } from '@/shared/types';
 import type { MessageRequest, MessageResponse, AsyncTask } from '@/shared/messageTypes';
 
 const db = new BookmarkDB();
 
 // Async task storage
 const asyncTasks = new Map<string, AsyncTask>();
+
+/** 回退进行中标志：两次回退交错会各自补建一遍目录 */
+let rollbackInFlight = false;
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 
@@ -24,24 +32,6 @@ chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 async function getSettings(): Promise<AppSettings> {
   const stored = await db.getSetting('appSettings') as Partial<AppSettings> | undefined;
   const merged = { ...DEFAULT_SETTINGS, ...stored };
-
-  // A persisted config still pointing at a retired gateway would leave every AI
-  // feature failing with no obvious cause — fall back to the current default.
-  const endpoint = (stored?.apiEndpoint ?? '').replace(/\/+$/, '');
-  if (endpoint && DEPRECATED_API_ENDPOINTS.includes(endpoint)) {
-    return {
-      ...merged,
-      apiEndpoint: DEFAULT_SETTINGS.apiEndpoint,
-      apiModel: DEFAULT_SETTINGS.apiModel,
-      apiFormat: DEFAULT_SETTINGS.apiFormat,
-    };
-  }
-
-  // 模型同样会下架：网关对已下架模型直接回 400，而 {...DEFAULT, ...stored}
-  // 里 stored 优先，光改默认值对老用户不生效。只迁移 endpoint 盖不住这种情况。
-  if (stored?.apiModel && DEPRECATED_API_MODELS.includes(stored.apiModel)) {
-    return { ...merged, apiModel: DEFAULT_SETTINGS.apiModel };
-  }
 
   // 清掉出厂硬编码的一级目录：它们不在用户收藏夹里，却会在「一级目录配置」中
   // 显示成已有目录。用户真有同名文件夹的话会从收藏夹结构重新出现。
@@ -82,14 +72,18 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
     case 'GET_ALL_BOOKMARKS':
       return getAllBookmarks();
 
-    case 'GENERATE_EMBEDDING':
+    case 'GENERATE_EMBEDDING': {
       // Float32Array does not survive chrome.runtime.sendMessage's JSON
       // serialization — it arrives as {0:..,1:..} with no length. Return a
       // plain number[] to match the documented contract.
-      return Array.from(await generateEmbedding(msg.text));
+      const { embeddingEndpoint } = await getSettings();
+      return Array.from(await generateEmbedding(msg.text, embeddingEndpoint));
+    }
 
-    case 'GENERATE_EMBEDDINGS_BATCH':
-      return (await generateEmbeddingsBatch(msg.texts)).map((v) => Array.from(v));
+    case 'GENERATE_EMBEDDINGS_BATCH': {
+      const { embeddingEndpoint } = await getSettings();
+      return (await generateEmbeddingsBatch(msg.texts, embeddingEndpoint)).map((v) => Array.from(v));
+    }
 
     case 'SEARCH':
       return handleSearch(msg.query);
@@ -109,6 +103,9 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
     case 'ORGANIZE_DOMAIN_CLUSTER':
       return handleDomainCluster();
 
+    case 'ORGANIZE_SUGGEST_TAXONOMY':
+      return handleSuggestTaxonomy();
+
     case 'ORGANIZE_SEMANTIC_CLUSTER':
       return handleSemanticCluster(msg.bookmarkIds);
 
@@ -124,8 +121,23 @@ async function handleMessage(msg: MessageRequest): Promise<unknown> {
     case 'ORGANIZE_EXECUTE':
       return handleOrganizeExecute(msg.directoryTree, msg.rootId);
 
+    case 'ORGANIZE_SNAPSHOT_INFO':
+      return handleOrganizeSnapshotInfo();
+
+    case 'ORGANIZE_ROLLBACK':
+      return handleOrganizeRollback();
+
     case 'GET_FOLDER_STRUCTURE':
       return handleGetFolderStructure();
+
+    case 'GET_FOLDER_BOOKMARKS':
+      return getFolderBookmarks(msg.folderId);
+
+    case 'MOVE_BOOKMARKS':
+      return moveBookmarks(msg.ids, msg.targetFolderId);
+
+    case 'MERGE_FOLDERS':
+      return mergeFolders(msg.sourceIds, msg.targetFolderId);
 
     case 'GET_SETTINGS':
       return getSettings();
@@ -165,7 +177,7 @@ async function handleSearch(query: string): Promise<unknown> {
   const allVectors = await db.getAllVectors();
 
   // Generate query embedding
-  const queryVector = await generateEmbedding(query);
+  const queryVector = await generateEmbedding(query, settings.embeddingEndpoint);
 
   // Semantic search
   const semanticResults = allVectors.map((v) => ({
@@ -194,7 +206,7 @@ async function handleSearch(query: string): Promise<unknown> {
     });
 
     try {
-      const scores = await rerank(query, candidateTexts);
+      const scores = await rerank(query, candidateTexts, settings.rerankerEndpoint);
       rerankCandidates.forEach((c, i) => rerankScores.set(c.id, scores[i]));
     } catch {
       // Reranker unavailable - fall back to semantic scores
@@ -506,6 +518,7 @@ async function handleConnectivityCheck(
   const CONCURRENCY = 5; // Reduce concurrency to avoid rate limiting
   const TIMEOUT_MS = 15000; // Increase timeout to 15 seconds
   const deadIds: string[] = [];
+  const locale = (await getSettings()).language;
   let idx = 0;
 
   /**
@@ -574,7 +587,7 @@ async function handleConnectivityCheck(
 
       const done = filteredIds.length - filteredIds.slice(idx).length;
       broadcastProgress('CONNECTIVITY_CHECK_PROGRESS', done, filteredIds.length,
-        `检测中 (${done}/${filteredIds.length})`);
+        progressText(locale, 'checkingLinks', { done, total: filteredIds.length }));
     }
   }
 
@@ -587,7 +600,7 @@ async function handleConnectivityCheck(
   if (deadIds.length > 0) {
     const tree = await chrome.bookmarks.getTree();
     const rootId = tree[0]?.children?.[0]?.id ?? '1';
-    const folderId = await findOrCreateFolderPath(['[待删除_失效]'], rootId);
+    const { id: folderId } = await findOrCreateFolderPath(['[待删除_失效]'], rootId);
     for (const id of deadIds) {
       await moveBookmark(id, folderId).catch(() => {});
     }
@@ -612,14 +625,16 @@ async function handleAIClassifyStart(
   moveOutTargets: readonly string[] = [],
 ): Promise<{ taskId: string }> {
   const taskId = generateTaskId();
+  const settings = await getSettings();
 
+  // 语言要等 settings 读出来才知道，所以任务登记放在这之后——
+  // 这条是 AI 分类期间用户看到的第一句话，写死成中文会让「跟随语言」看起来没生效
   asyncTasks.set(taskId, {
     id: taskId,
     status: 'pending',
-    progress: { current: 0, total: 1, message: '正在准备...' },
+    progress: { current: 0, total: 1, message: progressText(settings.language, 'preparing') },
   });
 
-  const settings = await getSettings();
   const allBookmarks = await getAllBookmarks();
 
   let filtered: BookmarkNode[];
@@ -659,6 +674,10 @@ async function handleAIClassifyStart(
   } else {
     bookmarks = filtered;
   }
+
+  // 浏览器内部页（chrome://bookmarks/、扩展页…）不是网页书签，也没有主题可归；
+  // 参与整理只会被塞进某个目录，留在原处反而是对的
+  bookmarks = bookmarks.filter((b) => /^https?:/i.test(b.url));
 
   // 骨架的作用域：
   //   全局整理        → 整个书签栏
@@ -830,6 +849,8 @@ async function processAIClassify(
   try {
     task.status = 'running';
     const total = bookmarks.length;
+    // 进度文案在 service worker 里生成，拿不到侧边栏的 i18n，只能自己按语言取
+    const locale = settings.language;
 
     if (total === 0) {
       finish({}, [], [], statsFor({}));
@@ -837,7 +858,7 @@ async function processAIClassify(
     }
 
     // --- 阶段 0：补齐向量 ---
-    updateProgress(0, total, `获取向量中 (0/${total})`);
+    updateProgress(0, total, progressText(locale, 'fetchingVectors', { done: 0, total }));
     const allVectors = await db.getAllVectors();
     const vectorMap = new Map(allVectors.map((v) => [v.id, v.vector]));
 
@@ -846,12 +867,16 @@ async function processAIClassify(
       for (let i = 0; i < missing.length; i += BATCH_SIZE) {
         const batch = missing.slice(i, i + BATCH_SIZE);
         const texts = batch.map((b) => `${b.title} ${b.url}`);
-        const vectors = await generateEmbeddingsBatch(texts);
+        const vectors = await generateEmbeddingsBatch(texts, settings.embeddingEndpoint);
         for (let j = 0; j < batch.length; j++) {
           vectorMap.set(batch[j].id, vectors[j]);
           await db.putVector({ id: batch[j].id, vector: vectors[j], text: texts[j], updatedAt: Date.now() });
         }
-        updateProgress(i + batch.length, missing.length, `生成向量中 (${i + batch.length}/${missing.length})`);
+        updateProgress(
+          i + batch.length,
+          missing.length,
+          progressText(locale, 'generatingVectors', { done: i + batch.length, total: missing.length }),
+        );
       }
     }
 
@@ -873,14 +898,69 @@ async function processAIClassify(
     const rootFolderId = skeletonRootId ?? (await getRootFolderId());
     const allFolders = await getExistingFolders(rootFolderId);
 
+    // 用户确认过的一级目录分类法。有它的时候它就是**白名单**：
+    // 候选路径只保留落在这套顶层里的，模型也不许另起顶层。
+    // 没有它就退回旧行为（沿用现有结构）。
+    //
+    // 只对**全局整理**生效：文件夹范围整理时骨架根是那个文件夹自己，
+    // 书签栏的一级分类法在那里没有意义，硬套会把东西搬到文件夹外面去。
+    const allowedTop = new Map<string, string>(); // 小写 → 展示名
+    for (const name of userCategories ?? []) {
+      const trimmed = name.trim();
+      if (trimmed) allowedTop.set(trimmed.toLowerCase(), trimmed);
+    }
+    const globalScope = !skeletonRootId || skeletonRootId === (await getRootFolderId());
+    const enforceTopLevel = globalScope && allowedTop.size > 0;
+    const topOf = (path: string): string => path.split('/')[0];
+    const isAllowedTop = (segment: string): boolean => allowedTop.has(segment.toLowerCase());
+
+    /** 模型偶尔会写近义顶层名（「网络设备」写成「网络」），先按包含关系找回分类法里的写法 */
+    const canonicalTop = (segment: string): string | undefined => {
+      const direct = allowedTop.get(segment.toLowerCase());
+      if (direct) return direct;
+      const lower = segment.toLowerCase();
+      for (const [key, display] of allowedTop) {
+        if (lower.includes(key) || key.includes(lower)) return display;
+      }
+      return undefined;
+    };
+
+    // --- 阶段 1.5：确定性规则 ---
+    //
+    // B 站永远是视频、京东永远是购物。这类判断交给模型只会带来抖动：
+    // 同一批书签两次整理归到不同目录，而平台归属根本不需要「判断」。
+    // 规则只在全局整理下生效——文件夹范围整理时路径是相对该文件夹的，
+    // 硬套书签栏的「视频/购物」会把东西搬出用户指定的文件夹。
+    const ruleResolved = new Map<string, string>(); // id → 已确定的完整路径
+    const lockedTop = new Map<string, string>(); // id → 只锁定顶层
+    if (globalScope) {
+      for (const b of bookmarks) {
+        const rule = applyRules(b);
+        if (!rule) continue;
+        if (rule.final) ruleResolved.set(b.id, rule.top);
+        else if (rule.sub) ruleResolved.set(b.id, `${rule.top}/${rule.sub}`);
+        else lockedTop.set(b.id, rule.top);
+      }
+    }
+
     const initialPaths: string[] = [];
     if (mode === 'fit') {
       for (const folder of allFolders) {
         if (folder.path === UNCLASSIFIED_DIR) continue;
         if (folder.path.includes('[待删除_失效]')) continue;
         if (keepSkeletonPath && !keepSkeletonPath(folder.path)) continue;
+        // 白名单外的旧结构一律不给——给了模型就会照抄，旧目录永远清不掉
+        if (enforceTopLevel && !isAllowedTop(topOf(folder.path))) continue;
         initialPaths.push(folder.path);
       }
+    }
+    // 分类法本身始终是候选：replan 下它甚至是唯一的候选（骨架为空时模型没有参照）
+    for (const name of allowedTop.values()) {
+      if (!initialPaths.includes(name)) initialPaths.push(name);
+    }
+    // 规则产出的顶层也必须是候选（分类法可能没包含它们，例如用户手动删过）
+    for (const name of RULE_TOP_LEVELS) {
+      if (!initialPaths.includes(name)) initialPaths.push(name);
     }
     // 用户勾选的移出目标始终可选
     for (const target of forceIncludePaths) {
@@ -888,20 +968,38 @@ async function processAIClassify(
     }
 
     // --- 阶段 2：分批交给 AI 归档 ---
-    updateProgress(0, total, 'AI 归档中');
+    updateProgress(0, total, progressText(locale, 'classifying'));
     const maxDepth = settings.organizeMaxDepth ?? 3;
-    const ordered = orderForBatching(vectors, [...bookmarks]);
+    // 规则已经定了完整路径的（视频/购物）不必再问模型，省调用也省得它改主意
+    const aiBookmarks = bookmarks.filter((b) => !ruleResolved.has(b.id));
+    const ordered = orderForBatching(vectors, [...aiBookmarks]);
+
+    // 「现在位于」提示：模型看不见书签当前在哪，就只能凭标题重猜一次，
+    // 于是同一份书签两次整理结果不同、在两棵近义目录之间来回搬。
+    // getExistingFolders 已经给出「目录路径 → 直属书签」，直接反查即可。
+    const currentPathById = new Map<string, string>();
+    for (const folder of allFolders) {
+      for (const id of folder.bookmarkIds) currentPathById.set(id, folder.path);
+    }
 
     const outcome = canUseAI
       ? await classifyBookmarks(
-          ordered.map((b) => ({ id: b.id, title: b.title, url: b.url })),
+          ordered.map((b) => ({
+            id: b.id,
+            title: b.title,
+            url: b.url,
+            currentPath: currentPathById.get(b.id),
+            lockedTop: lockedTop.get(b.id),
+          })),
           initialPaths,
           settings,
           {
             batchSize: MAX_BATCH_SIZE,
             maxDepth,
             mustUsePaths: forceIncludePaths,
-            onProgress: (done, count) => updateProgress(done, count, `AI 归档中 (${done}/${count})`),
+            userCategories,
+            onProgress: (done, count) =>
+              updateProgress(done, count, progressText(locale, 'classifyingCount', { done, total: count })),
           },
         )
       : {
@@ -914,20 +1012,259 @@ async function processAIClassify(
     // --- 阶段 3：汇合 ---
     const createdSet = new Set(outcome.createdPaths);
     const byPath = new Map<string, string[]>();
+
+    // 顶层白名单兜底：模型不遵守规矩时，能对上的按包含关系归位。
+    // 对不上的**不直接判死刑**——先挑出来定向重试一次。此前直接丢进「未分类」，
+    // 实测一次丢掉了 97 条 Python 书签（模型写了分类法里没有的「编程/Python」），
+    // 全都本该进「技术」。
+    const accepted: [string, string][] = [];
+    const rejected = new Map<string, string>();
     for (const [id, rawPath] of outcome.assignments) {
-      // 文件夹整理且允许移出时，路径是相对书签栏的；新目录要建在该文件夹内部
-      const path = createdSet.has(rawPath) && newDirPrefix ? `${newDirPrefix}${rawPath}` : rawPath;
+      let path = rawPath;
+      // 规则锁定了顶层的（Linux / 教程）：模型只该决定二级。
+      // 它写了别的顶层时，把顶层的决定权收回来——保留模型给的二级名。
+      const locked = lockedTop.get(id);
+      if (locked) {
+        const [top, ...rest] = path.split('/');
+        if (top !== locked) path = rest.length > 0 ? `${locked}/${rest.join('/')}` : locked;
+      }
+
+      if (!enforceTopLevel) {
+        accepted.push([id, path]);
+        continue;
+      }
+      const [top, ...rest] = path.split('/');
+      const canonical = canonicalTop(top);
+      if (canonical) accepted.push([id, [canonical, ...rest].join('/')]);
+      else rejected.set(id, path);
+    }
+
+    const repaired = new Map<string, string>();
+    if (rejected.size > 0 && canUseAI) {
+      const titleById = new Map(bookmarks.map((b) => [b.id, b]));
+      const items = Array.from(rejected.keys()).map((id) => ({
+        id,
+        title: titleById.get(id)?.title ?? '',
+        url: titleById.get(id)?.url ?? '',
+      }));
+      const fixed = await reclassifyIntoAllowlist(items, Array.from(allowedTop.values()), settings, maxDepth);
+      for (const [id, path] of Object.entries(fixed)) {
+        const [top, ...rest] = path.split('/');
+        const canonical = canonicalTop(top);
+        if (canonical) repaired.set(id, [canonical, ...rest].join('/'));
+      }
+    }
+
+    let droppedToUnclassified = 0;
+    const finalAssignments: [string, string][] = [...accepted];
+    for (const id of rejected.keys()) {
+      const fixed = repaired.get(id);
+      if (fixed) finalAssignments.push([id, fixed]);
+      else {
+        finalAssignments.push([id, UNCLASSIFIED_DIR]);
+        droppedToUnclassified++;
+      }
+    }
+
+    // 规则已经定好完整路径的（视频/购物）：直接并入，不经过模型
+    for (const [id, path] of ruleResolved) {
       byPath.set(path, [...(byPath.get(path) ?? []), id]);
     }
 
-    const assignedIds = new Set(outcome.assignments.keys());
+    for (const [id, normalized] of finalAssignments) {
+      // 文件夹整理且允许移出时，路径是相对书签栏的；新目录要建在该文件夹内部
+      const path =
+        createdSet.has(normalized) && newDirPrefix ? `${newDirPrefix}${normalized}` : normalized;
+      byPath.set(path, [...(byPath.get(path) ?? []), id]);
+    }
+
+    const assignedIds = new Set([...outcome.assignments.keys(), ...ruleResolved.keys()]);
     const unassignedIds = bookmarks.filter((b) => !assignedIds.has(b.id)).map((b) => b.id);
 
-    const directoryTree = mergeDirectoryTree(
+    const merged = mergeDirectoryTree(
       Array.from(byPath.entries()).map(([path, ids]) => ({ path, ids })),
       unassignedIds,
       newDirPrefix ? `${newDirPrefix}${UNCLASSIFIED_DIR}` : UNCLASSIFIED_DIR,
     );
+
+    // 把散落在 `硬件/存储`、`技术/存储` 里的内容折回一级「存储」。
+    // 规则层只认关键词，没命中的同类书签会被模型放回旧子目录，
+    // 结果同一个主题被劈成三处。折完再跑「单条目录合并」，顺序不能反。
+    const folded = globalScope
+      ? foldPathsIntoTopLevel(merged, STORAGE_TOP, STORAGE_HINTS, STORAGE_CONTAINER_NAMES)
+      : { tree: merged, moved: 0 };
+
+    // 「一个网页一个目录」的确定性兜底：只装 1 条的末级目录并回上级。
+    // 只对全局整理做——文件夹范围整理时，用户要的就是那个文件夹内部的细分。
+    const collapsedInfo = globalScope
+      ? collapseTinyDirectories(folded.tree, 2, new Set(RULE_TOP_LEVELS))
+      : { tree: merged, collapsed: 0 };
+    let directoryTree = collapsedInfo.tree;
+
+
+    // 把嵌套了另一个一级目录的路径提回一级：技术/操作系统/Linux → Linux。
+    // 必须排在「补二级目录」之前——提回来的书签同样需要补二级，
+    // 否则刚折进来的会直接躺在一级目录下。
+    const nestedFolded = { folded: 0 };
+    if (globalScope) {
+      const domainTops = new Set([
+        LINUX_TOP, STORAGE_TOP, NETWORK_TOP, VIRTUALIZATION_TOP, VIDEO_TOP, SHOPPING_TOP,
+        GITHUB_TOP, WORK_TOP, WINDOWS_TOP,
+      ]);
+      const nested = foldNestedTopLevels(directoryTree, domainTops, new Set([TUTORIAL_TOP]));
+      directoryTree = nested.tree;
+      nestedFolded.folded = nested.folded;
+    }
+
+    // 「教程」只收纯教学：Python/Agent 这类本质是领域内容，搬回对应领域
+    let tutorialFoldedCount = 0;
+    if (globalScope) {
+      const tutorialFolded = foldTutorialTopics(directoryTree, TUTORIAL_TOP, UNCLASSIFIED_DIR);
+      directoryTree = tutorialFolded.tree;
+      if (tutorialFolded.folded > 0) {
+        tutorialFoldedCount = tutorialFolded.folded;
+      }
+    }
+
+    // --- 阶段 3.5：给「直接躺在一级目录下」的书签补二级目录 ---
+    //
+    // 模型经常只给顶层不给二级（实测「教程」94/167、「图像处理」97/103 条
+    // 直接躺在顶层），加上「单条目录合并」会把零星子目录并回父目录，
+    // 结果就是整理完一看还是一堆没分类的书签。这一步单独补。
+    let bareSplit = 0;
+    if (globalScope && canUseAI) {
+      const byId = new Map(bookmarks.map((b) => [b.id, b]));
+      const nextTree: Record<string, string[]> = { ...directoryTree };
+
+      for (const [path, ids] of Object.entries(directoryTree)) {
+        if (path.includes('/') || ids.length < MIN_BARE_FOR_SPLIT) continue;
+        if (NO_SPLIT_TOPS.includes(path)) continue; // Github：用户要的就是平铺
+
+        const existingSubs = Object.keys(directoryTree)
+          .filter((p) => p.startsWith(`${path}/`))
+          .map((p) => p.slice(path.length + 1))
+          .filter((p) => !p.includes('/'));
+
+        updateProgress(
+          total, total,
+          progressText(locale, 'splittingBare', { top: path, count: ids.length }),
+        );
+
+        const filled = await splitBareAssignments(
+          ids.map((id) => ({
+            id,
+            title: byId.get(id)?.title ?? '',
+            url: byId.get(id)?.url ?? '',
+          })),
+          path,
+          existingSubs,
+          settings,
+          maxDepth,
+        );
+
+        const remaining: string[] = [];
+        for (const id of ids) {
+          const target = filled[id];
+          if (target) {
+            nextTree[target] = [...(nextTree[target] ?? []), id];
+            bareSplit++;
+          } else {
+            remaining.push(id);
+          }
+        }
+        nextTree[path] = remaining;
+      }
+
+      directoryTree = nextTree;
+    }
+
+    // --- 阶段 4：「其它」的二次处理 ---
+    //
+    // 第一轮没归类的书签不该直接丢给用户。它们之间往往还有共同主题，
+    // 再问一次模型，允许它新建少量顶层目录，把「其它」拆干净。
+    let refinedFallback = 0;
+    if (globalScope && canUseAI) {
+      const leftoverIds = directoryTree[UNCLASSIFIED_DIR] ?? [];
+      if (leftoverIds.length >= MIN_FALLBACK_FOR_REFINE) {
+        updateProgress(
+          total, total,
+          progressText(locale, 'refiningFallback', { count: leftoverIds.length }),
+        );
+        const byId = new Map(bookmarks.map((b) => [b.id, b]));
+        const items = leftoverIds.map((id) => ({
+          id,
+          title: byId.get(id)?.title ?? '',
+          url: byId.get(id)?.url ?? '',
+        }));
+        const refined = await refineFallback(
+          items,
+          [...allowedTop.values(), ...RULE_TOP_LEVELS],
+          settings,
+          maxDepth,
+        );
+
+        const nextTree: Record<string, string[]> = { ...directoryTree };
+        delete nextTree[UNCLASSIFIED_DIR];
+        const remaining: string[] = [];
+        for (const id of leftoverIds) {
+          const path = refined[id];
+          const normalized = path && path !== UNCLASSIFIED_DIR ? path : undefined;
+          if (normalized) {
+            nextTree[normalized] = [...(nextTree[normalized] ?? []), id];
+            refinedFallback++;
+          } else {
+            remaining.push(id);
+          }
+        }
+        if (remaining.length > 0) nextTree[UNCLASSIFIED_DIR] = remaining;
+        directoryTree = nextTree;
+      }
+    }
+
+    const detailParts: string[] = [];
+
+    // 只有两三条书签的一级目录并回「其它」：顶层是给领域用的，
+    // 二次处理时模型会给 2 条书签造一个「论坛」顶层
+    if (globalScope) {
+      const smallFolded = foldSmallTopLevels(
+        directoryTree, MIN_TOP_FOR_KEEP, new Set(RULE_TOP_LEVELS), UNCLASSIFIED_DIR,
+      );
+      directoryTree = smallFolded.tree;
+      if (smallFolded.folded > 0) {
+        detailParts.push(`合并了 ${smallFolded.folded} 个过小的一级目录`);
+      }
+    }
+
+    // Linux 下的通用领域词（硬件/编程）换成它自己的维度词，
+    // 否则会和「驱动」「设备管理」重复
+    if (globalScope) {
+      const normalized = normalizeSubfoldersUnderTop(
+        directoryTree, LINUX_TOP, LINUX_ALLOWED_SUBS, LINUX_SUB_ALIASES, LINUX_SUB_FALLBACK,
+      );
+      directoryTree = normalized.tree;
+      if (normalized.renamed > 0) {
+        detailParts.push(`规范了 ${normalized.renamed} 个 ${LINUX_TOP} 的二级目录名`);
+      }
+    }
+    if (outcome.detail) detailParts.push(outcome.detail);
+    if (droppedToUnclassified > 0) {
+      detailParts.push(`${droppedToUnclassified} 条书签的目录不在分类法内，已归入「其它」`);
+    }
+    if (tutorialFoldedCount > 0) {
+      detailParts.push(`把 ${tutorialFoldedCount} 类教程搬回对应领域`);
+    }
+    if (nestedFolded.folded > 0) {
+      detailParts.push(`把 ${nestedFolded.folded} 个嵌套目录提回一级`);
+    }
+    if (bareSplit > 0) {
+      detailParts.push(`为 ${bareSplit} 条书签补上了二级目录`);
+    }
+    if (folded.moved > 0) {
+      detailParts.push(`把 ${folded.moved} 个目录折回一级「${STORAGE_TOP}」`);
+    }
+    if (collapsedInfo.collapsed > 0) {
+      detailParts.push(`合并了 ${collapsedInfo.collapsed} 个只装 1 条书签的目录`);
+    }
 
     const stats = statsFor({
       skeletonCount: initialPaths.length,
@@ -940,7 +1277,7 @@ async function processAIClassify(
         : canUseAI
           ? 'ai-naming-failed'
           : 'ai-unavailable',
-      warningDetail: outcome.detail,
+      warningDetail: detailParts.length > 0 ? detailParts.join('；') : undefined,
     });
 
     finish(directoryTree, initialPaths, outcome.createdPaths, stats);
@@ -960,6 +1297,7 @@ async function handleOrganizeExecute(
   // 混进 moved 会让人以为整理干了活，实际一条都没动
   let inPlace = 0;
   let skipped = 0;
+  let failed = 0;
   const failures: string[] = [];
   const allVectors = await db.getAllVectors();
   const vectorMap = new Map(allVectors.map((v) => [v.id, v.vector]));
@@ -977,6 +1315,24 @@ async function handleOrganizeExecute(
   // 实际用到的目录路径——「东西被建到哪儿去了」在界面上原本完全看不见
   const paths: string[] = [];
 
+  // 先拍拆卸点：整理一旦开始就改不回来了，快照必须发生在任何一次 move 之前。
+  // 快照写失败不阻断整理（整理本身仍然可用），但要在结果里说清楚，
+  // 否则用户会以为「撤销」按钮消失只是界面问题。
+  //
+  // 先把上一份读出来：整理有可能一条都不动（重复跑已整理好的收藏夹），
+  // 那次空跑不该把上一份有意义的拆卸点顶掉。
+  let snapshotSaved = false;
+  let previousSnapshot: OrganizeSnapshot | undefined;
+  try {
+    previousSnapshot = await db.getOrganizeSnapshot(SNAPSHOT_ID);
+    await db.putOrganizeSnapshot(await captureSnapshot());
+    snapshotSaved = true;
+  } catch (err) {
+    console.error('[BM] Failed to capture organize snapshot:', err);
+  }
+
+  const createdFolderIds = new Set<string>();
+
   for (const [path, bookmarkIds] of Object.entries(directoryTree)) {
     if (existingPaths && !existingPaths.has(path)) {
       skipped += bookmarkIds.length;
@@ -984,8 +1340,8 @@ async function handleOrganizeExecute(
     }
 
     // Create folder path
-    const pathParts = path.split('/');
-    const folderId = await findOrCreateFolderPath(pathParts, rootId);
+    const { id: folderId, createdIds } = await findOrCreateFolderPath(path.split('/'), rootId);
+    for (const id of createdIds) createdFolderIds.add(id);
     paths.push(path);
 
     // Move bookmarks to this folder
@@ -1004,7 +1360,10 @@ async function handleOrganizeExecute(
         moved++;
       } catch (err) {
         // 失败必须带出来：service worker 的日志在界面上看不到，
-        // 静默跳过会让「整理没反应」变成一个查不出的谜
+        // 静默跳过会让「整理没反应」变成一个查不出的谜。
+        // 计数**不封顶**（列表只留前 5 条）：`failed: 5` 在 300 条失败时
+        // 会把「大面积失败」说成「零星失败」，这是最需要看见的信号
+        failed++;
         if (failures.length < 5) failures.push(`${bookmarkId}: ${String(err)}`);
         console.warn(`[BM] Failed to move bookmark ${bookmarkId}:`, err);
       }
@@ -1028,43 +1387,119 @@ async function handleOrganizeExecute(
     }
   }
 
-  // 清理本次搬空的目录（不动用户自己留的空文件夹）
-  const pruned = await pruneEmptiedFolders(emptied);
+  // 清理本次搬空的目录。作用域根（用户点名要整理的那个文件夹）排除在外：
+  // 允许移出时它可能被搬空，但把用户刚整理的那个目录本身删掉不是他要的结果
+  const pruneResult = await pruneEmptiedFolders(emptied, new Set([rootId]));
+  let pruned = pruneResult.pruned;
+  const removedIds = [...pruneResult.removedIds];
 
-  return { moved, inPlace, skipped, pruned, failed: failures.length, failures, paths };
-}
-
-/**
- * 只删除**本次整理搬空的**目录。
- *
- * 原实现从书签栏递归删除任何空目录——包括用户自己留的空文件夹。跑一次整理
- * （哪怕一条书签都没移动）就会把「稍后阅读」这类占位目录删掉；在
- * `onlyUseExistingDirectories=true` 下尤其矛盾，那个开关的语义正是保持用户既有结构。
- *
- * 现在只考虑「被搬走过书签的父目录」，且删除时再次确认它确实空了。
- * 删掉一个目录可能让它的父目录也变空——但只有那个父目录**同样在搬空集合里**
- * 才会被继续删除，用户自己的空目录一律不动。
- */
-async function pruneEmptiedFolders(emptied: ReadonlySet<string>): Promise<number> {
-  let pruned = 0;
-  let changed = true;
-
-  while (changed) {
-    changed = false;
-    for (const id of emptied) {
-      const node = await chrome.bookmarks.get(id).catch(() => []);
-      if (node.length === 0) continue; // 已被删除
-
-      const children = await chrome.bookmarks.getChildren(id).catch(() => [null]);
-      if (children.length > 0) continue;
-
-      await chrome.bookmarks.remove(id).catch(() => {});
-      pruned++;
-      changed = true;
+  // 全局整理后，还有一类残留：整理前就已经空着、这次也没被方案选中的顶层目录。
+  // prune 不碰它们（它只处理「本轮搬空的」，以保护用户留的占位目录），
+  // 但全局整理换了整套分类法之后，这些名字已经不属于新结构，留着就是「没删干净」。
+  //
+  // 规则收得很窄：只删**顶层**、只删**空**。深层空目录仍按原规则保护——
+  // 用户可能留了「稍后阅读」这类占位，而顶层分类法上的残留是另一回事。
+  if (rootId === (await getRootFolderId())) {
+    const plannedTops = new Set(
+      Object.keys(directoryTree).map((path) => path.split('/')[0].toLowerCase()),
+    );
+    for (const child of await chrome.bookmarks.getChildren(rootId)) {
+      if (child.url || plannedTops.has(child.title.toLowerCase())) continue;
+      const kids = await chrome.bookmarks.getChildren(child.id).catch(() => null);
+      if (kids === null || kids.length > 0) continue;
+      try {
+        await chrome.bookmarks.remove(child.id);
+        removedIds.push(child.id);
+        pruned++;
+      } catch (err) {
+        console.warn(`[BM] Failed to remove leftover top-level folder ${child.title}:`, err);
+      }
     }
   }
 
-  return pruned;
+  // 目录没了，它的目录向量还指着这个 id。不清掉的话，实时归档会把新收藏的书签
+  // 往一个不存在的目录搬——`moveBookmark` 抛错并被吞掉，表现成「自动归档没反应」
+  for (const id of removedIds) {
+    await db.deleteDirectoryVector(id).catch(() => {});
+  }
+
+  // 把「本次新建了哪些目录」补进快照——撤销时靠它把空壳删干净。
+  // 这一步失败不影响整理结果，只是让撤销退化成「还原书签、保留新目录」
+  if (snapshotSaved) {
+    if (createdFolderIds.size > 0) {
+      try {
+        const snapshot = await db.getOrganizeSnapshot(SNAPSHOT_ID);
+        if (snapshot) {
+          await db.putOrganizeSnapshot({ ...snapshot, createdFolderIds: [...createdFolderIds] });
+        }
+      } catch (err) {
+        console.error('[BM] Failed to record created folders in snapshot:', err);
+      }
+    }
+
+    // 一条都没动：这次空跑不该顶掉上一份有意义的拆卸点
+    if (moved === 0 && createdFolderIds.size === 0) {
+      try {
+        if (previousSnapshot) await db.putOrganizeSnapshot(previousSnapshot);
+        else await db.deleteOrganizeSnapshot(SNAPSHOT_ID);
+      } catch (err) {
+        console.error('[BM] Failed to restore previous snapshot:', err);
+      }
+    }
+  }
+
+  return { moved, inPlace, skipped, pruned, failed, failures, paths };
+}
+
+/**
+ * 「撤销整理」的可用性查询。
+ *
+ * 只回时间戳，不回快照本体——快照可能有几千个节点，
+ * 每次打开向导都把它搬过消息通道没有必要。
+ */
+async function handleOrganizeSnapshotInfo(): Promise<unknown> {
+  const snapshot = await db.getOrganizeSnapshot(SNAPSHOT_ID);
+  if (!snapshot) return { available: false };
+  return { available: true, createdAt: snapshot.createdAt };
+}
+
+/**
+ * 把书签树还原到上次整理之前。
+ *
+ * **只有完全成功才删快照**：回退会返回失败清单而不是抛错，如果照样把快照删掉，
+ * 用户既看到「有 N 条没还原回去」，又失去了唯一的重试手段——树就停在半还原状态。
+ * 失败时保留快照，再点一次即可重试（回退本身是幂等的：已在原位的不会再动）。
+ */
+async function handleOrganizeRollback(): Promise<unknown> {
+  // 两次回退交错会各自通过「快照还在」的检查，然后各自补建一遍目录
+  if (rollbackInFlight) {
+    throw new Error('上一次撤销还在进行中');
+  }
+
+  const snapshot = await db.getOrganizeSnapshot(SNAPSHOT_ID);
+  if (!snapshot) {
+    throw new Error(progressText((await getSettings()).language, 'undoNone'));
+  }
+
+  rollbackInFlight = true;
+  try {
+    const result = await rollbackToSnapshot(snapshot);
+
+    if (result.failed > 0) return result;
+
+    await db.deleteOrganizeSnapshot(SNAPSHOT_ID);
+
+    // 只清掉被删除/换了 id 的那些目录的向量——它们的 id 已经指向不存在的目录，
+    // 留着会让新收藏的书签被自动归进空气里。其它目录的向量与本次回退无关，
+    // 整表清空会让实时归档对所有目录一起失效
+    for (const id of result.affectedFolderIds) {
+      await db.deleteDirectoryVector(id).catch(() => {});
+    }
+
+    return result;
+  } finally {
+    rollbackInFlight = false;
+  }
 }
 
 /** id → 父目录 id 的全量映射，用于判断书签是从哪个目录搬走的 */
@@ -1085,6 +1520,34 @@ async function buildParentMap(): Promise<Map<string, string>> {
 
 // --- Folder Structure ---
 
+/** 目录下的书签数，含所有子目录 */
+function countBookmarksIn(node: chrome.bookmarks.BookmarkTreeNode): number {
+  let total = node.url ? 1 : 0;
+  for (const child of node.children ?? []) total += countBookmarksIn(child);
+  return total;
+}
+
+/**
+ * 让 AI 把现有的一级目录收敛成一套分类法（≤ MAX_TOP_LEVELS 个）。
+ *
+ * 这一步独立于逐批归档：它看的是「全集」，所以能做出全局一致的决定。
+ * 返回里同时带上现有目录及计数，界面上可以直接对照着改。
+ */
+async function handleSuggestTaxonomy(): Promise<unknown> {
+  const settings = await getSettings();
+  const tree = await chrome.bookmarks.getTree();
+  const bar = tree[0]?.children?.[0];
+
+  const existing: ExistingTopLevel[] = (bar?.children ?? [])
+    .filter((node) => !node.url)
+    .map((node) => ({ name: node.title, count: countBookmarksIn(node) }))
+    .sort((a, b) => b.count - a.count);
+
+  const suggestion = await suggestTaxonomy(existing, settings, RULE_TOP_LEVELS);
+  return { ...suggestion, existing };
+}
+
+
 async function handleGetFolderStructure(): Promise<unknown> {
   const tree = await chrome.bookmarks.getTree();
   const root = tree[0]?.children?.[0];
@@ -1104,12 +1567,11 @@ async function handleGetFolderStructure(): Promise<unknown> {
     for (const child of node.children) {
       if (!child.url) { // It's a folder
         const currentPath = parentPath ? `${parentPath}/${child.title}` : child.title;
-        const bookmarkCount = child.children?.filter((c) => c.url).length ?? 0;
         results.push({
           id: child.id,
           title: child.title,
           path: currentPath,
-          count: bookmarkCount,
+          count: countBookmarksIn(child),
         });
         results.push(...collectFolders(child, currentPath));
       }
@@ -1180,6 +1642,7 @@ async function handleGetIndexStats(): Promise<unknown> {
 }
 
 async function handleRebuildIndex(): Promise<unknown> {
+  const settings = await getSettings();
   const bookmarks = await getAllBookmarks();
   await db.clear('vectors');
   const total = bookmarks.length;
@@ -1187,7 +1650,7 @@ async function handleRebuildIndex(): Promise<unknown> {
   for (let i = 0; i < total; i += BATCH_SIZE) {
     const batch = bookmarks.slice(i, i + BATCH_SIZE);
     const texts = batch.map((b) => `${b.title} ${b.url} ${b.path}`);
-    const vectors = await generateEmbeddingsBatch(texts);
+    const vectors = await generateEmbeddingsBatch(texts, settings.embeddingEndpoint);
 
     for (let j = 0; j < batch.length; j++) {
       await db.putVector({
@@ -1234,7 +1697,8 @@ chrome.bookmarks.onChanged.addListener(async (id, changeInfo) => {
     if (!bm) return;
 
     const text = `${bm.title} ${bm.url} ${bm.path}`;
-    const vector = await generateEmbedding(text);
+    const { embeddingEndpoint } = await getSettings();
+    const vector = await generateEmbedding(text, embeddingEndpoint);
     await db.putVector({
       id,
       vector,

@@ -16,79 +16,74 @@ export function DomainClusterView({ clusters, onToggle, onRename, onSelectAll, o
   const selectedCount = clusters.filter((c) => c.selected).length;
 
   return (
-    <div className="space-y-4">
-      <h3 className="text-sm font-semibold text-gray-700">{t('organize.domainStep')}</h3>
-      <p className="text-xs text-gray-500">{t('organize.domainStep.hint')}</p>
-
-      <div className="flex gap-2 items-center">
-        <span className="text-xs text-gray-400 flex-1">
-          {t('organize.domainStep.selected', { selected: selectedCount, total: clusters.length })}
-        </span>
-        <button onClick={onSelectAll} className="text-xs text-indigo-600 hover:underline">{t('organize.domainStep.selectAll')}</button>
-        <button onClick={onDeselectAll} className="text-xs text-gray-500 hover:underline">{t('organize.domainStep.deselectAll')}</button>
+    <div className="space-y-5">
+      <div className="space-y-1">
+        <p className="eyebrow">Organize · Domains</p>
+        <h3 className="text-[15px] font-semibold text-gray-900">{t('organize.domainStep')}</h3>
+        <p className="text-[11px] leading-relaxed text-gray-500">{t('organize.domainStep.hint')}</p>
       </div>
 
-      <div className="space-y-1 max-h-80 overflow-y-auto">
+      <div className="flex items-center gap-1">
+        <span className="flex-1 text-[11px] text-gray-500">
+          {t('organize.domainStep.selected', { selected: selectedCount, total: clusters.length })}
+        </span>
+        <button onClick={onSelectAll} className="btn-text">{t('organize.domainStep.selectAll')}</button>
+        <button onClick={onDeselectAll} className="btn-text text-gray-500">{t('organize.domainStep.deselectAll')}</button>
+      </div>
+
+      <div className="list max-h-80 divide-y divide-gray-100 overflow-y-auto">
         {clusters.map((cluster) => (
           <div
             key={cluster.domain}
-            className={`flex items-center gap-3 p-2 rounded-lg border ${cluster.selected ? 'border-indigo-200 bg-indigo-50' : 'border-gray-200 bg-white'}`}
+            className={`list-row items-center ${cluster.selected ? 'bg-primary/[0.05]' : ''}`}
           >
             <input
               type="checkbox"
               checked={cluster.selected}
               onChange={() => onToggle(cluster.domain)}
-              className="w-4 h-4 text-primary rounded"
+              className="mt-0.5 h-4 w-4 rounded"
             />
-            <div className="flex-1 min-w-0">
-              <span className="text-sm text-gray-700">{cluster.domain}</span>
-              <span className="text-xs text-gray-400 ml-2">({cluster.count})</span>
-              {cluster.hasPortal && (
-                <span
-                  className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-amber-50 text-amber-700 border border-amber-200"
-                  title={t('organize.domainStep.portalBadgeHint')}
-                >
-                  {t('organize.domainStep.portalBadge')}
-                </span>
-              )}
-              {cluster.existingFolder && (
-                <span
-                  className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-emerald-50 text-emerald-700 border border-emerald-200"
-                  title={t('organize.domainStep.inFolderHint')}
-                >
-                  {t('organize.domainStep.inFolder', { path: cluster.existingFolder })}
-                </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-baseline gap-1.5">
+                <span className="truncate text-[12px] text-gray-800">{cluster.domain}</span>
+                <span className="tabular shrink-0 text-[10px] text-gray-400">{cluster.count}</span>
+              </div>
+              {(cluster.hasPortal || cluster.existingFolder) && (
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {cluster.hasPortal && (
+                    <span className="badge badge-warn" title={t('organize.domainStep.portalBadgeHint')}>
+                      {t('organize.domainStep.portalBadge')}
+                    </span>
+                  )}
+                  {cluster.existingFolder && (
+                    <span className="badge badge-ok" title={t('organize.domainStep.inFolderHint')}>
+                      {t('organize.domainStep.inFolder', { path: cluster.existingFolder })}
+                    </span>
+                  )}
+                </div>
               )}
             </div>
             {cluster.selected && (
-              <>
-                <span className="text-gray-400 text-xs">→</span>
-                <input
-                  type="text"
-                  value={cluster.suggestedFolderName}
-                  onChange={(e) => onRename(cluster.domain, e.target.value)}
-                  className="w-28 px-2 py-1 text-xs border border-gray-200 rounded focus:border-indigo-400 focus:outline-none"
-                />
-              </>
+              <input
+                type="text"
+                value={cluster.suggestedFolderName}
+                onChange={(e) => onRename(cluster.domain, e.target.value)}
+                className="field w-28 shrink-0"
+                aria-label={t('organize.domainStep.renameLabel')}
+              />
             )}
           </div>
         ))}
         {clusters.length === 0 && (
-          <p className="text-sm text-gray-400 text-center py-4">{t('organize.domainStep.empty')}</p>
+          <p className="py-5 text-center text-[11px] text-gray-400">{t('organize.domainStep.empty')}</p>
         )}
       </div>
 
       <div className="flex gap-2">
-        <button
-          onClick={onBack}
-          className="flex-1 py-2.5 bg-gray-100 text-gray-700 text-sm rounded-lg hover:bg-gray-200"
-        >
+        <button onClick={onBack} className="btn-tonal flex-1">
           {t('organize.back')}
         </button>
-        <button
-          onClick={onNext}
-          className="flex-1 py-2.5 bg-primary text-white text-sm rounded-lg hover:bg-indigo-700"
-        >
+        <button onClick={onNext} className="btn-grad flex-1">
           {t('organize.next')} {selectedCount > 0 ? `(${selectedCount})` : ''}
         </button>
       </div>

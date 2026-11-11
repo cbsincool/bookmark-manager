@@ -1,4 +1,4 @@
-import { GENERIC_NAME_WORDS } from './constants';
+import { GENERIC_NAME_WORDS, UNCLASSIFIED_DIR } from './constants';
 
 /**
  * 目录名收敛：把 AI 或关键词提取产出的「空格拼接词」收敛成一个完整概念的词。
@@ -240,12 +240,59 @@ export function suggestDirectoryName(titles: readonly string[]): string {
     (a, b) => b[1] - a[1] || b[0].length - a[0].length,
   );
 
-  if (ranked.length === 0) return '未分类';
+  if (ranked.length === 0) return UNCLASSIFIED_DIR;
 
   // 只取最高频的那一个词。取多个词会把同义词拼在一起
   // （"Kubernetes" + "k8s" → "KubernetesK8s"），而它们是同义还是互补无法确定；
   // 单个词永远干净。丰富的目录名由 AI 命名负责，这里是 AI 不可用时的降级。
   // 关键词来自小写化后的标题，这里补回首字母大写（品牌词由 normalizeSegment 纠正）
   const word = ranked[0][0];
-  return normalizeSegment(word.charAt(0).toUpperCase() + word.slice(1)) || '未分类';
+  return normalizeSegment(word.charAt(0).toUpperCase() + word.slice(1)) || UNCLASSIFIED_DIR;
+}
+
+/**
+ * 导入书签时 Chrome 造出来的容器目录。
+ *
+ * 它们不是用户的知识分类，却会一直留在一级目录里（实测 `已导入` 下面还套着
+ * `已导入/书签栏/Linux`），整理时又被当成合法候选反复复用。
+ */
+const IMPORT_ARTIFACT_NAMES = new Set([
+  '已导入', '导入', '导入的书签', '书签栏', '其他书签', '移动设备书签',
+  'imported', 'imported bookmarks', 'bookmarks bar', 'bookmarks toolbar',
+  'other bookmarks', 'mobile bookmarks', 'favorites', '收藏夹',
+]);
+
+export function isImportArtifact(name: string): boolean {
+  return IMPORT_ARTIFACT_NAMES.has(name.trim().toLowerCase());
+}
+
+/**
+ * 把一组目录名里语义相近的合并掉（没有 AI 时的降级）。
+ *
+ * 规则：名字互相包含时保留较短的那个（`服务器硬件`/`电脑硬件`/`计算机硬件` → `硬件`，
+ * `网络设备` → `网络`）。只做字面判断，不猜语义——需要真正的语义合并时走
+ * `ORGANIZE_SUGGEST_TAXONOMY` 让模型来做。
+ */
+export function mergeNearDuplicateNames(names: readonly string[]): string[] {
+  const unique = Array.from(
+    new Set(
+      names
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0 && !isImportArtifact(name)),
+    ),
+  );
+
+  // 按长度决定谁被合并（短的是更一般的概念），但**输出保持输入顺序**——
+  // 调用方传进来时已按书签量降序排好，用户看到的顺序应该跟那个一致
+  const kept = new Set<string>();
+  for (const name of [...unique].sort((a, b) => a.length - b.length)) {
+    const lower = name.toLowerCase();
+    const covered = [...kept].some((existing) => {
+      const base = existing.toLowerCase();
+      return lower === base || lower.includes(base) || base.includes(lower);
+    });
+    if (!covered) kept.add(name);
+  }
+
+  return unique.filter((name) => kept.has(name));
 }

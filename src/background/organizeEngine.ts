@@ -95,12 +95,92 @@ function filedUnderFolder(
   return leaf.toLowerCase() === folderName.toLowerCase() ? only : undefined;
 }
 
-function suggestFolderName(domain: string): string {
-  const name = domain
-    .replace(/^(www|docs|blog|api|dev)\./i, '')
-    .replace(/\.(com|org|net|io|dev|co)$/i, '');
+/**
+ * 公共后缀里的两段式（`com.cn`、`co.uk`…）。
+ *
+ * 不认出来就会把 `blog.sina.com.cn` 收敛成 `Com`——「可注册域名」是后缀**之前**那一段，
+ * 后缀切错了名字就整个错位。
+ */
+const MULTI_PART_SUFFIXES = new Set([
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'com.tw', 'com.hk',
+  'co.jp', 'co.kr', 'co.uk', 'org.uk', 'ac.uk', 'com.au', 'com.sg',
+  'com.br', 'co.in', 'com.mx', 'com.tr', 'com.my', 'co.nz',
+]);
 
+/**
+ * 托管型后缀：每个用户各占一个子域。
+ *
+ * 必须当成公共后缀，否则 `foo.github.io` 和 `bar.github.io` 会被收敛成同一个
+ * `Github` 目录，两个毫不相干的站点被合并。
+ */
+const HOSTING_SUFFIXES = new Set([
+  'github.io', 'gitee.io', 'gitlab.io', 'netlify.app', 'vercel.app',
+  'pages.dev', 'workers.dev', 'blogspot.com', 'wordpress.com', 'notion.site',
+  'gitbook.io', 'readthedocs.io', 'herokuapp.com', 'azurewebsites.net',
+  's3.amazonaws.com',
+]);
+
+/** 通用子域前缀：只是站点分区（文档/博客/移动版/语言…），不承载品牌信息 */
+const GENERIC_SUBDOMAINS = new Set([
+  'www', 'm', 'mp', 'mobile', 'wap', 'touch',
+  'docs', 'doc', 'wiki', 'manual', 'help', 'support', 'faq',
+  'blog', 'news', 'post', 'article', 'zhuanlan', 'baijiahao', 'wenku', 'pan',
+  'api', 'dev', 'developer', 'developers', 'open', 'source', 'git', 'code',
+  'en', 'zh', 'cn', 'ja', 'ko', 'ru', 'fr', 'de', 'es', 'pt', 'it', 'hi', 'ar',
+  'app', 'web', 'my', 'go', 'get', 'try', 'start', 'learn', 'edu', 'community',
+  'forum', 'bbs', 'discuss', 'club', 'group',
+  'tech', 'cloud', 'static', 'cdn', 'img', 'pic', 'download', 'dl', 'mirror',
+  'shop', 'store', 'mall', 'pay', 'mail', 'smtp', 'admin', 'portal', 'account',
+  'login', 'sso', 'auth', 'id', 'passport', 'oa', 'erp', 'crm', 'hr',
+  'status', 'monitor', 'stats', 'analytics', 'search', 'test', 'demo', 'beta',
+  'staging', 'sandbox', 'old', 'new', 'v1', 'v2', 'os', 'detail', 'item', 't',
+]);
+
+function isIpAddress(host: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function publicSuffixLength(labels: readonly string[]): number {
+  const lastTwo = labels.slice(-2).join('.');
+  const lastThree = labels.slice(-3).join('.');
+  if (HOSTING_SUFFIXES.has(lastThree)) return 3;
+  if (MULTI_PART_SUFFIXES.has(lastTwo) || HOSTING_SUFFIXES.has(lastTwo)) return 2;
+  return 1;
+}
+
+function capitalize(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/**
+ * 把域名收敛成「人会给文件夹起的名字」。
+ *
+ * 原实现只剥固定的 `www|docs|blog|api|dev.` 前缀和 `com|org|net|io|dev|co` 后缀，
+ * 于是实测建出来的目录名是 `Zhuanlan.zhihu`、`Mp.weixin.qq`、`Wenku.baidu`、
+ * `Sina.com.cn`——全是站点**分区**名，不是站点名。
+ *
+ * 现在先剥通用子域前缀，再取可注册域名（公共后缀之前的那一段）。
+ * 副作用是同一站点的不同子域会收敛到同一个名字（`blog.csdn.net` 与 `www.csdn.net`
+ * 都变成 `Csdn`），这正是想要的：它们本来就是一个站，本该进同一个目录。
+ */
+export function suggestFolderName(domain: string): string {
+  const host = domain.trim().toLowerCase();
+  if (!host) return domain;
+
+  // 内网 IP 很常见（192.168.1.10），没有「可注册域名」可言，原样保留
+  if (isIpAddress(host)) return host;
+
+  const parts = host.split('.');
+  if (parts.length <= 2) return capitalize(parts[0]);
+
+  // 剥前缀时至少留两段，否则 zhihu.com 会被剥成 com
+  let labels = parts;
+  while (labels.length > 2 && GENERIC_SUBDOMAINS.has(labels[0])) {
+    labels = labels.slice(1);
+  }
+
+  const index = labels.length - publicSuffixLength(labels) - 1;
+  return capitalize(labels[index >= 0 ? index : 0]);
 }
 
 // --- K-means ---
@@ -305,6 +385,99 @@ export function mergeDirectoryTree(
   return tree;
 }
 
+/**
+ * 把散落在其它顶层下的某个主题，折回它自己的一级目录。
+ *
+ * 规则层只认标题/URL 里的关键词，没命中的同类书签会被模型放回旧子目录——
+ * 实测「存储」独立成一级后，`硬件/存储` 和 `技术/存储` 仍各留了二三十条，
+ * 同一个主题被劈成三处。
+ *
+ * 折叠规则按**末级名**决定二级：`硬件/存储/RAID` → `存储/RAID`，
+ * `技术/存储` → `存储`（末级只是容器词，没有信息量）。
+ */
+export function foldPathsIntoTopLevel(
+  tree: Record<string, readonly string[]>,
+  top: string,
+  hints: RegExp,
+  containerNames: ReadonlySet<string>,
+): { tree: Record<string, string[]>; moved: number } {
+  const result: Record<string, string[]> = {};
+  let moved = 0;
+
+  for (const [path, ids] of Object.entries(tree)) {
+    const parts = path.split('/');
+    const alreadyThere = parts[0] === top;
+    const matchIndex = parts.findIndex((part, index) => index > 0 && hints.test(part));
+
+    if (alreadyThere || matchIndex < 0) {
+      result[path] = [...(result[path] ?? []), ...ids];
+      continue;
+    }
+
+    const last = parts[parts.length - 1];
+    const target = containerNames.has(last) ? top : `${top}/${last}`;
+    result[target] = [...(result[target] ?? []), ...ids];
+    moved++;
+  }
+
+  return { tree: result, moved };
+}
+
+/**
+ * 把「只装了 1 条书签」的末级目录并回上级。
+ *
+ * 提示词里写了「少于 3 条不要单独建目录」，但模型经常不管——实测一次全局整理
+ * 留下 29 个只装 1 条的目录，收藏夹里点开一层又一层，只为看一条书签。
+ * 这一步是确定性的兜底：数量不够的目录不单独存在，内容上移到最近的、**本身就在树里**
+ * 的祖先；连祖先都没有就落到一级目录。
+ *
+ * 只处理**末级**（没有子目录挂在它下面的）路径 —— 有子目录的目录即使自己只有 1 条，
+ * 它仍是那棵子树的入口，不能删。
+ */
+export function collapseTinyDirectories(
+  tree: Record<string, readonly string[]>,
+  minSize = 2,
+  /**
+   * 这些顶层下面的子目录不参与合并。
+   *
+   * 合并的本意是收拾「一个网页一个目录」，但它会把 `Linux/内核`（只有 1 条）
+   * 直接并回 `Linux`——结果是书签全堆在一级目录下，等于没整理。
+   * 对天生需要二级的主题，宁可留一个只有 1 条的目录。
+   */
+  protectedTops: ReadonlySet<string> = new Set(),
+): { tree: Record<string, string[]>; collapsed: number } {
+  const paths = Object.keys(tree);
+  const hasChild = new Set<string>();
+  for (const path of paths) {
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) hasChild.add(parts.slice(0, i).join('/'));
+  }
+
+  const destination = (path: string): string => {
+    if (!path.includes('/')) return path;
+    if (hasChild.has(path)) return path;
+    if (protectedTops.has(path.split('/')[0])) return path;
+    if ((tree[path]?.length ?? 0) >= minSize) return path;
+
+    const parts = path.split('/');
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const ancestor = parts.slice(0, i).join('/');
+      if (ancestor in tree) return destination(ancestor);
+    }
+    return parts[0];
+  };
+
+  const result: Record<string, string[]> = {};
+  let collapsed = 0;
+  for (const path of paths) {
+    const dest = destination(path);
+    if (dest !== path) collapsed++;
+    result[dest] = [...(result[dest] ?? []), ...(tree[path] ?? [])];
+  }
+
+  return { tree: result, collapsed };
+}
+
 export function computeDirectoryVector(
   vectors: readonly Float32Array[],
 ): Float32Array {
@@ -336,4 +509,212 @@ export function computeDirectoryVector(
   }
 
   return avg;
+}
+
+/**
+ * 把某个顶层下「不该出现的通用子目录名」换成该主题自己的维度词。
+ *
+ * 实测 `Linux/硬件`(54)、`Linux/编程`(6)：模型把「硬件」「编程」这类
+ * 通用领域词当成了 Linux 的二级——它们是别的顶层的事，放在 Linux 下
+ * 既和 `Linux/驱动`、`Linux/设备管理` 重复，也让人一眼看不懂。
+ */
+export function remapSubNames(
+  tree: Record<string, readonly string[]>,
+  top: string,
+  aliases: Readonly<Record<string, string>>,
+): { tree: Record<string, string[]>; remapped: number } {
+  const result: Record<string, string[]> = {};
+  let remapped = 0;
+
+  for (const [path, ids] of Object.entries(tree)) {
+    const parts = path.split('/');
+    if (parts.length === 2 && parts[0] === top && aliases[parts[1]]) {
+      const target = `${top}/${aliases[parts[1]]}`;
+      result[target] = [...(result[target] ?? []), ...ids];
+      remapped++;
+    } else {
+      result[path] = [...(result[path] ?? []), ...ids];
+    }
+  }
+
+  return { tree: result, remapped };
+}
+
+/**
+ * 把「只有两三条书签」的一级目录并进兜底目录。
+ *
+ * 二次处理「其它」时允许模型新建顶层，实测它会给 2 条书签造一个「论坛」顶层——
+ * 顶层目录是给「领域」用的，两三条不成领域，留在「其它」里比单独立一个更清楚。
+ */
+export function foldSmallTopLevels(
+  tree: Record<string, readonly string[]>,
+  minSize: number,
+  protectedTops: ReadonlySet<string>,
+  fallback: string,
+): { tree: Record<string, string[]>; folded: number } {
+  const totals = new Map<string, number>();
+  for (const [path, ids] of Object.entries(tree)) {
+    const top = path.split('/')[0];
+    totals.set(top, (totals.get(top) ?? 0) + ids.length);
+  }
+
+  const result: Record<string, string[]> = {};
+  let folded = 0;
+  for (const [path, ids] of Object.entries(tree)) {
+    const top = path.split('/')[0];
+    const shouldFold = path === top
+      && !protectedTops.has(top)
+      && (totals.get(top) ?? 0) < minSize;
+
+    const target = shouldFold ? fallback : path;
+    if (shouldFold) folded++;
+    result[target] = [...(result[target] ?? []), ...ids];
+  }
+
+  return { tree: result, folded };
+}
+
+/**
+ * 把某个顶层下的二级目录名收进「允许集合」。
+ *
+ * 别名表只能覆盖已知的错法；模型还会时不时造出新的通用词。这里再加一道：
+ * 集合外的名字先按包含关系找最接近的，找不到就进兜底目录。
+ * 一级目录下面出现一眼看不懂的子目录，比「少了一个子目录」更难接受。
+ */
+export function normalizeSubfoldersUnderTop(
+  tree: Record<string, readonly string[]>,
+  top: string,
+  allowed: readonly string[],
+  aliases: Readonly<Record<string, string>>,
+  fallback: string,
+): { tree: Record<string, string[]>; renamed: number } {
+  const allowedLower = allowed.map((name) => name.toLowerCase());
+  const allowedSet = new Set(allowed);
+
+  const pick = (sub: string): string | undefined => {
+    if (allowedSet.has(sub)) return sub;
+    const alias = aliases[sub];
+    if (alias && allowedSet.has(alias)) return alias;
+
+    const lower = sub.toLowerCase();
+    for (const name of allowed) {
+      const base = name.toLowerCase();
+      if (lower.includes(base) || base.includes(lower)) return name;
+    }
+    // 别名表指向的合法名字也算
+    for (const [key, value] of Object.entries(aliases)) {
+      if (lower.includes(key.toLowerCase()) && allowedLower.includes(value.toLowerCase())) {
+        return allowed.find((name) => name.toLowerCase() === value.toLowerCase());
+      }
+    }
+    return undefined;
+  };
+
+  const result: Record<string, string[]> = {};
+  let renamed = 0;
+  for (const [path, ids] of Object.entries(tree)) {
+    const parts = path.split('/');
+    if (parts.length === 2 && parts[0] === top) {
+      const target = pick(parts[1]) ?? fallback;
+      const next = `${top}/${target}`;
+      if (target !== parts[1]) renamed++;
+      result[next] = [...(result[next] ?? []), ...ids];
+    } else {
+      result[path] = [...(result[path] ?? []), ...ids];
+    }
+  }
+
+  return { tree: result, renamed };
+}
+
+/**
+ * 把「嵌套了另一个一级目录」的路径提回那个一级目录。
+ *
+ * 实测 `技术/操作系统/Linux`、`技术/网络/RDMA`：模型把同一个领域又挂在了
+ * 别的顶层下面，于是「Linux」和「网络」各出现了两处，用户点开两个地方看到同类内容。
+ * 提到一级目录后，深层的段保留：`技术/网络/RDMA` → `网络/RDMA`。
+ *
+ * 只处理**领域型**顶层。`教程` 不在此列——教程是内容类型，`教程/网络` 是
+ * 「网络相关的教程」，提走反而丢了它的语义。
+ */
+export function foldNestedTopLevels(
+  tree: Record<string, readonly string[]>,
+  domainTops: ReadonlySet<string>,
+  skipTops: ReadonlySet<string> = new Set(),
+): { tree: Record<string, string[]>; folded: number } {
+  const result: Record<string, string[]> = {};
+  let folded = 0;
+
+  for (const [path, ids] of Object.entries(tree)) {
+    const parts = path.split('/');
+    // 内容类型顶层（教程）下的「网络」指的是「网络相关的教程」，不提出去
+    const hit = skipTops.has(parts[0])
+      ? -1
+      : parts.findIndex((part, index) => index > 0 && domainTops.has(part));
+
+    const target = hit < 0
+      ? path
+      : [parts[hit], ...parts.slice(hit + 1)].join('/');
+
+    if (hit >= 0) folded++;
+    result[target] = [...(result[target] ?? []), ...ids];
+  }
+
+  return { tree: result, folded };
+}
+
+/**
+ * 「教程」只收纯教学，其余按领域归。
+ *
+ * 用户定下的规则：`教程/Python`、`教程/Agent` 这类本质上是 Python / Agent 的内容，
+ * 应该待在对应领域里；教程只留跨领域的通用学习材料（学习方法、语言学习…）。
+ *
+ * 判据是确定的：如果该子目录名在**别的顶层**下已经有一个像样的目录（≥ minMatch 条），
+ * 或者它本身就是某个一级目录名，就把书签搬过去；否则留在教程。
+ * 这样 `教程/Python` → `技术/编程语言/Python`，而 `教程/OpenCV`（别处没有）保留。
+ */
+export function foldTutorialTopics(
+  tree: Record<string, readonly string[]>,
+  tutorialTop: string,
+  fallbackTop: string,
+  minMatch = 10,
+): { tree: Record<string, string[]>; folded: number } {
+  const domainTops = new Set(
+    Object.keys(tree)
+      .map((path) => path.split('/')[0])
+      .filter((top) => top !== tutorialTop && top !== fallbackTop),
+  );
+
+  // 叶子名 → 别处最大的同名目录
+  const best = new Map<string, { path: string; size: number }>();
+  for (const [path, ids] of Object.entries(tree)) {
+    const parts = path.split('/');
+    if (parts[0] === tutorialTop || parts.length < 2) continue;
+    const leaf = parts[parts.length - 1];
+    const prev = best.get(leaf);
+    if (!prev || ids.length > prev.size) best.set(leaf, { path, size: ids.length });
+  }
+
+  const result: Record<string, string[]> = {};
+  let folded = 0;
+  for (const [path, ids] of Object.entries(tree)) {
+    const parts = path.split('/');
+    if (parts.length === 2 && parts[0] === tutorialTop) {
+      const leaf = parts[1];
+      if (domainTops.has(leaf)) {
+        result[leaf] = [...(result[leaf] ?? []), ...ids];
+        folded++;
+        continue;
+      }
+      const hit = best.get(leaf);
+      if (hit && hit.size >= minMatch) {
+        result[hit.path] = [...(result[hit.path] ?? []), ...ids];
+        folded++;
+        continue;
+      }
+    }
+    result[path] = [...(result[path] ?? []), ...ids];
+  }
+
+  return { tree: result, folded };
 }

@@ -173,8 +173,8 @@ describe('suggestDirectoryName', () => {
     expect(suggestDirectoryName(['React​Hooks 教程'])).toBe('React');
   });
 
-  it('falls back to 未分类 when nothing usable is found', () => {
-    expect(suggestDirectoryName(['的 了', '教程'])).toBe('未分类');
+  it('falls back to 其它 when nothing usable is found', () => {
+    expect(suggestDirectoryName(['的 了', '教程'])).toBe('其它');
   });
 
   it('never produces a name containing a path separator', () => {

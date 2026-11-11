@@ -1,6 +1,6 @@
 import { openDB, type IDBPDatabase } from 'idb';
 import { DB_NAME, DB_VERSION, STORES } from './constants';
-import type { VectorEntry, BookmarkCache, DirectoryVector, BookmarkNode, PageSummary } from './types';
+import type { VectorEntry, BookmarkCache, DirectoryVector, BookmarkNode, PageSummary, OrganizeSnapshot } from './types';
 
 export class BookmarkDB {
   private dbPromise: Promise<IDBPDatabase>;
@@ -30,6 +30,9 @@ export class BookmarkDB {
         }
         if (!db.objectStoreNames.contains(STORES.PAGE_SUMMARIES)) {
           db.createObjectStore(STORES.PAGE_SUMMARIES, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(STORES.ORGANIZE_SNAPSHOTS)) {
+          db.createObjectStore(STORES.ORGANIZE_SNAPSHOTS, { keyPath: 'id' });
         }
       },
     });
@@ -91,6 +94,11 @@ export class BookmarkDB {
     return db.getAll(STORES.DIRECTORY_VECTORS);
   }
 
+  async deleteDirectoryVector(id: string): Promise<void> {
+    const db = await this.dbPromise;
+    await db.delete(STORES.DIRECTORY_VECTORS, id);
+  }
+
   // --- Settings ---
 
   async putSetting(key: string, value: unknown): Promise<void> {
@@ -137,7 +145,24 @@ export class BookmarkDB {
     await db.delete(STORES.PAGE_SUMMARIES, id);
   }
 
-  // --- Generic ---
+  // --- Organize snapshots (undo) ---
+
+  async putOrganizeSnapshot(snapshot: OrganizeSnapshot): Promise<void> {
+    const db = await this.dbPromise;
+    await db.put(STORES.ORGANIZE_SNAPSHOTS, snapshot);
+  }
+
+  async getOrganizeSnapshot(id: string): Promise<OrganizeSnapshot | undefined> {
+    const db = await this.dbPromise;
+    return db.get(STORES.ORGANIZE_SNAPSHOTS, id);
+  }
+
+  async deleteOrganizeSnapshot(id: string): Promise<void> {
+    const db = await this.dbPromise;
+    await db.delete(STORES.ORGANIZE_SNAPSHOTS, id);
+  }
+
+  // --- Generic
 
   async clear(storeName: string): Promise<void> {
     const db = await this.dbPromise;

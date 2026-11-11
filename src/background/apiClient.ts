@@ -88,8 +88,8 @@ export function resolveChatEndpoint(endpoint: string): string {
 
 /**
  * Normalize endpoint for Anthropic-native format:
- * users may provide a base URL like "https://host/a800"
- * or the full path "https://host/a800/v1/messages".
+ * users may provide a base URL like "https://host/proxy"
+ * or the full path "https://host/proxy/v1/messages".
  */
 export function resolveMessagesEndpoint(endpoint: string): string {
   const url = endpoint.replace(/\/+$/, '');
@@ -305,7 +305,7 @@ ${categoryList}
 Rules:
 1. Each bookmark goes into exactly ONE category based on its title
 2. Return ONLY a JSON object: { "category": ["bookmarkId1", "bookmarkId2"] }
-3. If title is unclear or generic, put in "未分类" category
+3. If title is unclear or generic, put in "其它" category
 
 Bookmarks (only titles):
 ${bookmarkList}`;
