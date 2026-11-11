@@ -2,6 +2,16 @@
   "name": "bookmark-manager",
   "version": "0.1.0",
   "private": true,
+  "description": "AI-powered Chrome bookmark organizer with duplicate cleanup and semantic search",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cbsincool/bookmark-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cbsincool/bookmark-manager/issues"
+  },
+  "homepage": "https://github.com/cbsincool/bookmark-manager#readme",
   "type": "module",
   "scripts": {
     "dev": "vite",

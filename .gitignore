@@ -1,35 +1,32 @@
 node_modules/
 dist/
-.superpowers/
+__pycache__/
 *.log
+
+# 本地编辑器 / 助手配置
+.claude/
 .gstack/
+.superpowers/
+
+# 开发过程文档（需求、计划、进度日志、设计稿）：只在本地保留，不上传到仓库
+docs/
+
+# 早期排查留下的一次性脚本、日志与产物，统一归档在这里
+.archive/
 
 # 测试用 Chrome profile：内含扩展 IndexedDB，可能残留 API 凭证，绝不能提交
 chrome-*/
 
-__pycache__/
 test/screenshots/
-
-# 早期排查留在仓库根目录的一次性脚本与产物，不属于项目
-/auto-log.txt
-/auto-test*.py
-/auto-test*.txt
-/capture-console.py
-/console-log.txt
-/debug-*.py
-/debug-log.txt
-/dist.rar
-/ext-page.png
-/full-auto-test.py
-/init-test-profile.py
-/kzt.txt
-/monitor-console.py
-/test-ext.py
-/test-extension*.py
-/test-with-agent-browser.bat
 
 # 端到端报告是每次运行重新生成的产物
 /test/verify-report.json
 
-# 真实书签导出（分析用，含用户隐私数据，绝不提交）
+# 真实书签导出与备份（含用户隐私数据，绝不提交）
 /test/_real-bookmarks.json
+/test/_real-tree.json
+/test/backup/
+
+# 只在本机跑的书签分析脚本
+/test/_analyze_real.py
+/test/export-bookmark-tree.py

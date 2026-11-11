@@ -48,8 +48,8 @@ def main() -> int:
             """async () => {
                 const out = {};
                 const urls = [
-                    'https://ai-gateway-inside.haplat.net/devops/v1/chat/completions',
-                    'https://ai-gateway-inside.haplat.net/devops/v1/models',
+                    'https://api.openai.com/v1/chat/completions',
+                    'https://api.openai.com/v1/models',
                 ];
                 for (const u of urls) {
                     try {

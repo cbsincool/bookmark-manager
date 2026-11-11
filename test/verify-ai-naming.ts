@@ -15,9 +15,9 @@ import {
 } from '../src/background/apiClient';
 import { normalizeDirectoryPath } from '../src/shared/directoryNaming';
 
-const ENDPOINT = process.env.BM_AI_ENDPOINT ?? 'https://ai-gateway-inside.haplat.net/devops/v1';
+const ENDPOINT = process.env.BM_AI_ENDPOINT ?? 'https://api.openai.com/v1';
 const KEY = process.env.BM_AI_KEY ?? '';
-const MODEL = process.env.BM_AI_MODEL ?? 'deepseek-v4.1-flash';
+const MODEL = process.env.BM_AI_MODEL ?? 'gpt-4o-mini';
 const FORMAT = process.env.BM_AI_FORMAT ?? 'openai';
 
 /** 覆盖中英混排、纯英文多词、中文带英文注解、通用词后缀等真实形态 */
