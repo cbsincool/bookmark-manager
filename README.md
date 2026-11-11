@@ -180,6 +180,16 @@ TypeScript, React 18, Vite 5, Zustand, Tailwind CSS 4, `idb`, Fuse.js, `@crxjs/v
 - The embedding model must produce **1024-dimensional** vectors (bge-m3). Other dimensions require changing `EMBEDDING_DIM` and rebuilding the index.
 - Very large libraries (several thousand bookmarks) mean many LLM calls; batch size and concurrency are tuned conservatively to avoid rate limits.
 
+## Welcome — feedback and PRs are very welcome
+
+Thanks for trying it out! Whether it works well for your library or falls apart on it, I'd like to hear about it.
+
+- **Something broken or annoying?** Open an [issue](https://github.com/cbsincool/bookmark-manager/issues) — a screenshot and a couple of example bookmarks help a lot.
+- **Want to change something?** Pull requests are welcome. Keep them focused, match the existing style, and add a unit test when the change is testable.
+- **Most useful of all:** try it on your own bookmarks and tell me how organize and dedup behave. Both depend heavily on the shape of a real library, so your data is worth more than any synthetic benchmark.
+
+If you like the extension, a ⭐ helps other people find it.
+
 ## License
 
 [MIT](LICENSE)
